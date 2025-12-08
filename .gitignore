@@ -18,3 +18,6 @@ venv/
 # 特定的配置文件 (如果它们包含敏感信息或仅在本地有效)
 # config/local.cfg
 nohup.out
+
+*.jpg
+*.png

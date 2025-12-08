@@ -7,11 +7,12 @@ seed: 42
 data:
   data_root: "/home/ruisi/mesh_compression/data/official"
   processed_dir: "/mnt/Lab/yeruisi/data/compression/dataset_preload"  # 预处理数据存放位置
-  point_num: 320000       # Encoder 输入的点云数量
-  batch_size: 1
+  point_num: 160000       # Encoder 输入的点云数量
+  batch_size: 2
   num_workers: 16
-  base_mesh_verts_min: 1000
-  base_mesh_verts_max: 3000
+  base_mesh_faces_min: 1000    # Base Mesh 目标面数范围
+  base_mesh_faces_max: 3000
+  simplification_backend: "pyfqmr" # "open3d" or "pyfqmr"
 
 # Model Settings
 model:
@@ -25,19 +26,19 @@ model:
 train:
   epochs: 200
   lr: 1.0e-5
-  weight_decay: 1.0e-4
-  save_interval: 10       # Epochs
+  weight_decay: 1.0e-5
+  save_interval: 3       # Epochs
   log_interval: 10        # Steps
   
 # Loss Weights
 loss:
   w_render: 1.0           # Normal Consistency Loss
-  w_laplacian: 0.01       # Mesh Smoothness
-  w_disp: 0.001           # Displacement L2 Regularization
+  w_laplacian: 0.0       # Mesh Smoothness
+  w_disp: 0.0           # Displacement L2 Regularization
 
 # Renderer Settings
 render:
   image_size: 512
-  views_per_sample: 64     # 每个样本随机渲染的视角数
-  dist_multiplier: 1.5
+  views_per_sample: 100     # 每个样本随机渲染的视角数
+  dist_multiplier: 1.2
 

@@ -126,7 +126,10 @@ def train(config, args):
         
     dataset = ScanToMeshDataset(
         data_root=config['data']['processed_dir'], 
-        split='train'
+        split='train',
+        base_faces_min=config['data']['base_mesh_faces_min'],
+        base_faces_max=config['data']['base_mesh_faces_max'],
+        backend=config['data'].get('simplification_backend', 'open3d')
     )
     
     dataloader = DataLoader(
