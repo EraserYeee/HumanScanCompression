@@ -4,9 +4,10 @@ from scipy.spatial import cKDTree
 import matplotlib.pyplot as plt
 
 class ClusterDemoFixed:
-    def __init__(self, mesh_path=None, pcd_path=None):
+    def __init__(self, mesh_path=None, pcd_path=None, patch_num_points=64):
         self.cur_vertex_idx = 0
         self.vis_mode = 0 # 0: Gradient (彩虹渐变), 1: Cluster (聚类随机色)
+        self.patch_num_points = patch_num_points
         
         # 1. 加载或生成数据
         if mesh_path is None:
@@ -25,11 +26,41 @@ class ClusterDemoFixed:
         # k=1: 让每个密集点找到最近的一个 Mesh 顶点
         _, self.point_to_vertex_indices = self.tree.query(self.dense_points, k=1)
         
+        # Apply Grouping Strategy
+        self._compute_groups(self.patch_num_points)
+
         # 3. 准备可视化几何体
         self._prepare_geometries()
         
         # 4. 启动可视化
         self._run_vis()
+
+    def _compute_groups(self, patch_num_points):
+        print(f"应用分组策略 (Patch Size: {patch_num_points})...")
+        # Initialize with -1 (meaning no group / dropped)
+        self.point_group_ids = np.full(len(self.dense_points), -1, dtype=int)
+        
+        unique_v_indices = np.unique(self.point_to_vertex_indices)
+        
+        for v_idx in unique_v_indices:
+            # Indices of points belonging to this vertex
+            point_indices = np.where(self.point_to_vertex_indices == v_idx)[0]
+            
+            if len(point_indices) > patch_num_points:
+                # Calculate distance to anchor
+                # points: (N, 3), anchor: (3,)
+                pts = self.dense_points[point_indices]
+                anchor = self.mesh_verts[v_idx]
+                dists = np.linalg.norm(pts - anchor, axis=1)
+                
+                # Keep top K smallest
+                keep_local_indices = np.argsort(dists)[:patch_num_points]
+                keep_global_indices = point_indices[keep_local_indices]
+                
+                self.point_group_ids[keep_global_indices] = v_idx
+            else:
+                # Keep all
+                self.point_group_ids[point_indices] = v_idx
 
     def _generate_dummy_data(self):
         # 生成一个球体 Mesh
@@ -67,6 +98,14 @@ class ClusterDemoFixed:
         # 广播到每个密集点
         self.colors_cluster = vertex_colors_random[self.point_to_vertex_indices]
         
+        # === Apply Gray for Dropped Points ===
+        # Points not in any group (id == -1) should be gray
+        gray_mask = (self.point_group_ids == -1)
+        gray_color = [0.5, 0.5, 0.5] # Gray
+        
+        self.colors_gradient[gray_mask] = gray_color
+        self.colors_cluster[gray_mask] = gray_color
+
         # === 初始化显示 ===
         # 默认使用 Gradient 模式
         self.current_base_colors = self.colors_gradient if self.vis_mode == 0 else self.colors_cluster
@@ -118,7 +157,8 @@ class ClusterDemoFixed:
         new_colors = self.current_base_colors.copy()
         
         # 2. 找到属于该顶点的点 (Mask)
-        mask = (self.point_to_vertex_indices == target_idx)
+        # Use point_group_ids instead of point_to_vertex_indices to respect the cropping
+        mask = (self.point_group_ids == target_idx)
         
         # 3. 染色 (亮绿色) - 无论什么模式，选中的都变绿
         new_colors[mask] = [0, 1, 0]
@@ -169,4 +209,4 @@ class ClusterDemoFixed:
         vis.destroy_window()
 
 if __name__ == "__main__":
-    demo = ClusterDemoFixed(mesh_path="0002_original_1000f.ply", pcd_path="0002_pointcloud_160000.ply")
+    demo = ClusterDemoFixed(mesh_path="0002_original_1000f.ply", pcd_path="0002_pointcloud_160000.ply", patch_num_points=64)

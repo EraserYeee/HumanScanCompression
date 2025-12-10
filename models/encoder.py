@@ -1,29 +1,46 @@
 import torch
 import torch.nn as nn
 from torch_scatter import scatter_max
+from .tnet import ScatterSTNkd
 
 class LocalFeatureEncoder(nn.Module):
     """
     负责从分组后的局部点云中提取 Base Mesh 顶点的特征向量。
-
-    职责:
-    1. 对每个局部点应用 PointMLP (Point-wise features)。
-    2. 使用 Scatter Max 将属于同一顶点的点特征聚合。
-    3. 输出 Base Mesh 顶点的特征 Embedding。
+    
+    Updated: Integrated ScatterSTNkd (Feature Transform)
     """
-    def __init__(self, input_dim=3, hidden_dim=64, output_dim=128):
+    def __init__(self, input_dim=3, hidden_dim=64, output_dim=128, use_feature_transform=True):
         super().__init__()
         self.output_dim = output_dim
+        self.use_feature_transform = use_feature_transform
         
-        # Point-wise MLP (Shared MLP)
-        # [Input -> 64 -> 64 -> Output]
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+        # 1. First Layer (Input -> 64)
+        # PointNet: 64 dim before T-Net
+        self.conv1 = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU()
         )
+        
+        # 2. Feature Transform (STNkd)
+        if self.use_feature_transform:
+            self.fstn = ScatterSTNkd(k=64)
+            
+        # 3. Subsequent Layers
+        # 64 -> hidden(usually 128) -> output(usually 1024 in PointNet, but here we keep it smaller e.g. 128)
+        self.conv2 = nn.Sequential(
+            nn.Linear(64, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU()
+        )
+        
+        self.conv3 = nn.Sequential(
+            nn.Linear(hidden_dim, output_dim),
+            nn.BatchNorm1d(output_dim)
+            # No ReLU here usually if it's the final feature before pooling? 
+            # Original PointNet uses ReLU before MaxPool. Let's add it.
+        )
+        self.relu = nn.ReLU()
 
     def forward(self, local_points: torch.Tensor, cluster_idx: torch.Tensor, num_verts: int):
         """
@@ -34,44 +51,65 @@ class LocalFeatureEncoder(nn.Module):
 
         Returns:
             vertex_features: (B, V, D) 每个 Base Mesh 顶点的特征
+            trans_feat: (B*V, K, K) or None
         """
-        B, P, _ = local_points.shape
+        B, P, D = local_points.shape
         
-        # 1. Point-wise Feature Extraction
-        # (B, P, 3) -> (B, P, D)
-        point_feats = self.mlp(local_points)
+        # Flatten for Scatter operations
+        # local_points: (B*P, 3)
+        flat_points = local_points.view(-1, D)
         
-        # 2. Scatter Aggregation (Max Pooling)
-        # scatter_max 不支持 Batch 维度直接操作 (它在 dim=0 上操作)，
-        # 所以我们需要将 Batch 维度展平，并调整 cluster_idx 加上 batch offset。
-        
-        # Flatten features: (B*P, D)
-        flat_point_feats = point_feats.view(-1, self.output_dim)
-        
-        # Create batch offset for indices
+        # Calculate Global Cluster Indices (handling batch offset)
         # offset: [0, V, 2V, ...] shape (B, 1) -> expand to (B, P)
         batch_offset = (torch.arange(B, device=local_points.device) * num_verts).view(-1, 1)
-        
-        # global_idx: (B, P) -> (B*P)
-        # global_idx[i] = batch_idx * V + vertex_idx
         global_cluster_idx = (cluster_idx + batch_offset).view(-1)
         
-        # Max Pooling Aggregation
-        # out: (B*V, D)
-        # dim_size = B * V (Total number of vertices in the batch)
-        # 注意: scatter_max 返回 (values, indices)，我们要 values
+        # Total clusters (vertices) in the batch
+        total_clusters = B * num_verts
+        
+        # --- PointNet Pipeline ---
+        
+        # 1. Layer 1
+        x = self.conv1(flat_points) # (B*P, 64)
+        
+        # 2. Feature Transform
+        trans_feat = None
+        if self.use_feature_transform:
+            x, trans_feat = self.fstn(x, global_cluster_idx, total_clusters)
+            
+        # 3. Layer 2 & 3
+        x = self.conv2(x) # (B*P, hidden)
+        point_feats = self.conv3(x) # (B*P, output)
+        
+        # 4. Scatter Max Pooling
+        # aggregated_feats: (B*V, output)
         aggregated_feats, _ = scatter_max(
-            flat_point_feats, 
+            point_feats, 
             global_cluster_idx, 
             dim=0, 
-            dim_size=B * num_verts
+            dim_size=total_clusters
         )
         
-        # 3. Reshape back to Batch
+        # Apply ReLU after pooling? Or before?
+        # PointNet: conv(relu) -> maxpool. 
+        # My conv3 has BN but no ReLU. Let's apply ReLU to point_feats before pooling?
+        # Or apply after? Standard PointNet:
+        # x = F.relu(bn(conv(x)))
+        # x = max_pool(x)
+        
+        # So I should add ReLU to conv3 or apply it here.
+        # Let's apply it here to point_feats before max pooling.
+        # Actually scatter_max on ReLU-ed features is safe (min is 0).
+        point_feats = self.relu(point_feats)
+        aggregated_feats, _ = scatter_max(
+            point_feats, 
+            global_cluster_idx, 
+            dim=0, 
+            dim_size=total_clusters
+        )
+        
+        # 5. Reshape back to Batch
         # (B*V, D) -> (B, V, D)
         vertex_features = aggregated_feats.view(B, num_verts, self.output_dim)
         
-        # 注意: 如果某个顶点没有分配到任何点，scatter_max 默认返回 0 (对于 ReLU 激活后的特征是合理的)
-        # 如果使用的是 scatter_mean，可能需要处理分母为 0 的情况
-        
-        return vertex_features
+        return vertex_features, trans_feat

@@ -8,7 +8,7 @@ data:
   data_root: "/home/ruisi/mesh_compression/data/official"
   processed_dir: "/mnt/Lab/yeruisi/data/compression/dataset_preload"  # 预处理数据存放位置
   point_num: 160000       # Encoder 输入的点云数量
-  batch_size: 2
+  batch_size: 1
   num_workers: 16
   base_mesh_faces_min: 1000    # Base Mesh 目标面数范围
   base_mesh_faces_max: 3000
@@ -21,11 +21,12 @@ model:
   dec_hidden_dim: 64      # Decoder MLP Hidden Dim
   subdivision_levels: 8   # Positional Encoding Levels
   subdivision_rate: 4     # NGF Subdivision Rate (每条边细分段数)
+  use_feature_transform: True
 
 # Training Settings
 train:
   epochs: 200
-  lr: 1.0e-5
+  lr: 1.0e-4
   weight_decay: 1.0e-5
   save_interval: 3       # Epochs
   log_interval: 10        # Steps
@@ -35,10 +36,11 @@ loss:
   w_render: 1.0           # Normal Consistency Loss
   w_laplacian: 0.0       # Mesh Smoothness
   w_disp: 0.0           # Displacement L2 Regularization
+  w_mat: 0.001          # Feature Transform Regularization
 
 # Renderer Settings
 render:
   image_size: 512
-  views_per_sample: 100     # 每个样本随机渲染的视角数
+  views_per_sample: 32     # 每个样本随机渲染的视角数
   dist_multiplier: 1.2
 

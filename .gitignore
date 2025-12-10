@@ -4,6 +4,7 @@
 /debug_train_meshes/
 /wandb/
 /checkpoints/
+/results/
 # Python 相关的临时文件或缓存
 __pycache__/
 *.pyc

@@ -15,6 +15,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 from models.pipeline import Stage2Pipeline
+from models.tnet import feature_transform_regularizer # Import loss function
 from data.stage2_dataset import ScanToMeshDataset, stage2_collate_fn
 from utils.render import DifferentiableNormalRenderer
 
@@ -150,7 +151,8 @@ def train(config, args):
         'enc_hidden_dim': config['model']['enc_hidden_dim'],
         'dec_hidden_dim': config['model']['dec_hidden_dim'],
         'subdivision_levels': config['model']['subdivision_levels'],
-        'subdivision_rate': config['model']['subdivision_rate']
+        'subdivision_rate': config['model']['subdivision_rate'],
+        'use_feature_transform': config['model'].get('use_feature_transform', True)
     })
     # No need for .to(device), accelerate handles it
     
@@ -219,6 +221,7 @@ def train(config, args):
             loss_render_batch = 0
             loss_lap_batch = 0
             loss_disp_batch = 0
+            loss_mat_batch = 0 # Matrix regularization loss
             
             # Iterate over batch (Gradient Accumulation logic effectively)
             for b in range(len(base_verts_list)):
@@ -234,7 +237,7 @@ def train(config, args):
                 b_scan = scan_points[b].unsqueeze(0) # (1, P, 3)
                 
                 # Forward
-                f_verts, f_faces, disp = model(b_verts, b_faces, b_normals, b_scan)
+                f_verts, f_faces, disp, trans_feat = model(b_verts, b_faces, b_normals, b_scan)
                 
                 # GT
                 g_verts = gt_verts_list[b].unsqueeze(0)
@@ -251,17 +254,19 @@ def train(config, args):
                         print(f"[Error] GT Faces max index {g_faces.max()} >= GT Verts count {g_verts.shape[1]}")
                     is_valid = False
                 
-                # Export Debug Mesh on error OR first step
-                if (not is_valid or step == 0) and accelerator.is_main_process:
-                    tag = "error" if not is_valid else "init"
-                    debug_export_meshes(
-                        b_verts[0], b_faces[0], 
-                        f_verts[0], f_faces, 
-                        g_verts[0], g_faces[0],
-                        step, b, tag=tag
-                    )
-                    if not is_valid:
-                        continue # Skip loss calculation for broken mesh
+                # Export Debug Mesh on error OR every 10 steps
+                should_export = (step % 100 == 0 and b == 0) or (not is_valid)
+                # should_export = False
+                # if should_export and accelerator.is_main_process:
+                #     tag = "error" if not is_valid else f"step_{step}"
+                #     debug_export_meshes(
+                #         b_verts[0], b_faces[0], 
+                #         f_verts[0], f_faces, 
+                #         g_verts[0], g_faces[0],
+                #         step, b, tag=tag
+                #     )
+                #     if not is_valid:
+                #         continue # Skip loss calculation for broken mesh
 
                 # Loss for this item
                 # 1. Render Loss
@@ -271,14 +276,14 @@ def train(config, args):
                 
                 pred_img, gt_img = renderer(f_verts, f_faces_expanded, g_verts, g_faces)
                 
-                # Debug Export Images (First step)
-                if step == 0 and b == 0 and accelerator.is_main_process:
-                    debug_export_images(pred_img, gt_img, step, b, tag="init")
+                # Debug Export Images (Every 10 steps)
+                if should_export and accelerator.is_main_process:
+                    debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
                 
                 loss_render = torch.nn.functional.l1_loss(pred_img, gt_img)
                 
                 # 2. Laplacian
-                f_mesh = Meshes(verts=f_verts, faces=f_faces_expanded)
+                # f_mesh = Meshes(verts=f_verts, faces=f_faces_expanded)
                 # loss_lap = mesh_laplacian_smoothing(f_mesh)
                 loss_lap = torch.tensor(0.0, device=accelerator.device)
                 
@@ -286,11 +291,20 @@ def train(config, args):
                 # loss_disp = torch.mean(disp ** 2)
                 loss_disp = torch.tensor(0.0, device=accelerator.device)
                 
+                # 4. Feature Transform Regularization
+                loss_mat = torch.tensor(0.0, device=accelerator.device)
+                if trans_feat is not None:
+                    loss_mat = feature_transform_regularizer(trans_feat)
+                
                 # Weighted Sum
+                # w_mat: usually small, e.g. 0.001
+                w_mat = config['loss'].get('w_mat', 0.001)
+                
                 loss = (
                     config['loss']['w_render'] * loss_render +
                     config['loss']['w_laplacian'] * loss_lap +
-                    config['loss']['w_disp'] * loss_disp
+                    config['loss']['w_disp'] * loss_disp + 
+                    w_mat * loss_mat
                 )
                 
                 # Accumulate (average later)
@@ -303,6 +317,7 @@ def train(config, args):
                 loss_render_batch += loss_render.item()
                 loss_lap_batch += loss_lap.item()
                 loss_disp_batch += loss_disp.item()
+                loss_mat_batch += loss_mat.item()
             
             if torch.cuda.is_available(): torch.cuda.synchronize()
             t_forward_backward = time.time()
@@ -312,7 +327,8 @@ def train(config, args):
             t_step_end = time.time()
 
             if accelerator.is_main_process:
-                print(f"Step {step} | Data: {t_data_avail - t_end:.4f}s | Device: {t_to_device - t_data_avail:.4f}s | Fwd+Bwd: {t_forward_backward - t_to_device:.4f}s | Step: {t_step_end - t_forward_backward:.4f}s")
+                # print(f"Step {step} | Data: {t_data_avail - t_end:.4f}s | Device: {t_to_device - t_data_avail:.4f}s | Fwd+Bwd: {t_forward_backward - t_to_device:.4f}s | Step: {t_step_end - t_forward_backward:.4f}s")
+                pass
 
             step += 1
             
@@ -323,13 +339,15 @@ def train(config, args):
                     "loss/render": loss_render_batch / len(base_verts_list),
                     "loss/laplacian": loss_lap_batch / len(base_verts_list),
                     "loss/disp": loss_disp_batch / len(base_verts_list),
+                    "loss/mat": loss_mat_batch / len(base_verts_list),
                     "lr": optimizer.param_groups[0]['lr'],
                     "epoch": epoch
                 }, step=step)
                 
             pbar.set_postfix({
                 'loss': f"{total_loss_batch:.4f}",
-                'rend': f"{loss_render_batch / len(base_verts_list):.4f}"
+                'rend': f"{loss_render_batch / len(base_verts_list):.4f}",
+                'mat': f"{loss_mat_batch / len(base_verts_list):.4f}"
             })
 
             t_end = time.time()
