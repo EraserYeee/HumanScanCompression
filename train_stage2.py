@@ -237,7 +237,7 @@ def train(config, args):
                 b_scan = scan_points[b].unsqueeze(0) # (1, P, 3)
                 
                 # Forward
-                f_verts, f_faces, disp, trans_feat = model(b_verts, b_faces, b_normals, b_scan)
+                f_verts, f_faces, disp, trans_feat, vertex_features = model(b_verts, b_faces, b_normals, b_scan)
                 
                 # GT
                 g_verts = gt_verts_list[b].unsqueeze(0)
@@ -255,18 +255,18 @@ def train(config, args):
                     is_valid = False
                 
                 # Export Debug Mesh on error OR every 10 steps
-                should_export = (step % 100 == 0 and b == 0) or (not is_valid)
+                should_export = (step % 300 == 0 and b == 0) or (not is_valid)
                 # should_export = False
-                # if should_export and accelerator.is_main_process:
-                #     tag = "error" if not is_valid else f"step_{step}"
-                #     debug_export_meshes(
-                #         b_verts[0], b_faces[0], 
-                #         f_verts[0], f_faces, 
-                #         g_verts[0], g_faces[0],
-                #         step, b, tag=tag
-                #     )
-                #     if not is_valid:
-                #         continue # Skip loss calculation for broken mesh
+                if should_export and accelerator.is_main_process:
+                    tag = "error" if not is_valid else f"step_{step}"
+                    debug_export_meshes(
+                        b_verts[0], b_faces[0], 
+                        f_verts[0], f_faces, 
+                        g_verts[0], g_faces[0],
+                        step, b, tag=tag
+                    )
+                    if not is_valid:
+                        continue # Skip loss calculation for broken mesh
 
                 # Loss for this item
                 # 1. Render Loss
@@ -312,6 +312,40 @@ def train(config, args):
                 
                 # Use accelerator for backward
                 accelerator.backward(loss)
+                
+                # --- Gradient & Feature Check ---
+                if step % 10 == 0 and accelerator.is_main_process:
+                    # Check Feature Embedding Statistics
+                    if vertex_features is not None:
+                         # vertex_features: (B, V, D)
+                         # Calculate variance/std across vertices (dim=1)
+                         feat_std = vertex_features.std(dim=1).mean().item()
+                         feat_mean = vertex_features.mean().item()
+                         print(f"[Feat Check] Step {step}: Feature Std (across verts) = {feat_std:.6f} | Mean = {feat_mean:.6f}")
+                         if feat_std < 1e-4:
+                             print(f"[Warning] Feature collapse detected! Std is extremely small.")
+
+                    # Check Decoder output layer (Displacement predictor)
+                    dec_grad_norm = 0.0
+                    if hasattr(model, 'module'): # Handle DDP wrapping
+                        dec_layer = model.module.decoder.mlp[-1]
+                        enc_first = model.module.encoder.conv1[0]
+                    else:
+                        dec_layer = model.decoder.mlp[-1]
+                        enc_first = model.encoder.conv1[0]
+                        
+                    if dec_layer.weight.grad is not None:
+                        dec_grad_norm = dec_layer.weight.grad.norm().item()
+                        dec_weight_norm = dec_layer.weight.norm().item()
+                        print(f"[Grad Check] Step {step}: Decoder Last Layer Grad Norm = {dec_grad_norm:.8f} | Weight Norm = {dec_weight_norm:.8f}")
+                        if dec_grad_norm < 1e-6:
+                            print(f"[Warning] Decoder gradient is extremely small!")
+
+                    # Check Encoder first layer (to see if grad flows back)
+                    if enc_first.weight.grad is not None:
+                         enc_grad_norm = enc_first.weight.grad.norm().item()
+                         print(f"[Grad Check] Step {step}: Encoder First Layer Grad Norm = {enc_grad_norm:.8f}")
+                # ----------------------
                 
                 total_loss_batch += loss.item()
                 loss_render_batch += loss_render.item()

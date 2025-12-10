@@ -72,6 +72,51 @@ class LocalPatchGrouper(nn.Module):
     def __init__(self):
         super().__init__()
 
+    # def forward(self, base_verts: torch.Tensor, base_normals: torch.Tensor, scan_points: torch.Tensor):
+    #     """
+    #     Args:
+    #         base_verts: (B, V, 3) Base mesh 顶点 (锚点中心)
+    #         base_normals: (B, V, 3) Base mesh 顶点法线 (锚点方向)
+    #         scan_points: (B, P, 3) Scan 采样点云
+
+    #     Returns:
+    #         local_points: (B, P, 3) 转换到局部坐标系的点
+    #         cluster_idx: (B, P) 每个点归属的顶点索引
+    #     """
+    #     B, P, _ = scan_points.shape
+        
+    #     # 1. KNN 搜索 (K=1)
+    #     # dists: (B, P, 1), idx: (B, P, 1)
+    #     knn_res = knn_points(scan_points, base_verts, K=1)
+    #     cluster_idx = knn_res.idx.squeeze(-1) # (B, P)
+        
+    #     # 2. Gather 锚点信息 (中心位置 & 法线)
+    #     # 创建 batch 索引用于 gather
+    #     batch_indices = torch.arange(B, device=scan_points.device).view(-1, 1).expand(-1, P)
+        
+    #     # gather: 从 (B, V, 3) 中根据 (B, P) 的索引取值 -> (B, P, 3)
+    #     # 注意: cluster_idx 的值域是 [0, V-1]
+    #     anchor_pos = base_verts[batch_indices, cluster_idx]      # (B, P, 3)
+        
+    #     # 3. 计算相对位置 (Global Relative)
+    #     delta_p = scan_points - anchor_pos # (B, P, 3)
+        
+    #     # 4. 计算并 Gather 旋转矩阵
+    #     # 优化: 先为 V 个顶点算好 R，再 Gather 到 P 个点，比直接为 P 个点算 R 省显存
+    #     R_verts = compute_rotation_matrices(base_normals) # (B, V, 3, 3)
+        
+    #     # Gather R: (B, P, 3, 3)
+    #     R_points = R_verts[batch_indices, cluster_idx] 
+        
+    #     # 5. 应用旋转 (坐标变换)
+    #     # p_local = R @ delta_p
+    #     # R: (B, P, 3, 3), delta_p: (B, P, 3) -> (B, P, 3, 1)
+    #     # matmul: (..., 3, 3) x (..., 3, 1) -> (..., 3, 1)
+        
+    #     p_local = torch.matmul(R_points, delta_p.unsqueeze(-1)).squeeze(-1)
+        
+    #     return p_local, cluster_idx
+
     def forward(self, base_verts: torch.Tensor, base_normals: torch.Tensor, scan_points: torch.Tensor):
         """
         Args:
@@ -101,19 +146,8 @@ class LocalPatchGrouper(nn.Module):
         # 3. 计算相对位置 (Global Relative)
         delta_p = scan_points - anchor_pos # (B, P, 3)
         
-        # 4. 计算并 Gather 旋转矩阵
-        # 优化: 先为 V 个顶点算好 R，再 Gather 到 P 个点，比直接为 P 个点算 R 省显存
-        R_verts = compute_rotation_matrices(base_normals) # (B, V, 3, 3)
-        
-        # Gather R: (B, P, 3, 3)
-        R_points = R_verts[batch_indices, cluster_idx] 
-        
-        # 5. 应用旋转 (坐标变换)
-        # p_local = R @ delta_p
-        # R: (B, P, 3, 3), delta_p: (B, P, 3) -> (B, P, 3, 1)
-        # matmul: (..., 3, 3) x (..., 3, 1) -> (..., 3, 1)
-        
-        p_local = torch.matmul(R_points, delta_p.unsqueeze(-1)).squeeze(-1)
+        # 4. 直接使用相对位置作为局部坐标 (不进行旋转)
+        p_local = delta_p
         
         return p_local, cluster_idx
 

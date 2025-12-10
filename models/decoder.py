@@ -1,19 +1,22 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from utils.subdivision import BarycentricSubdivision
 
 def positional_encoding(vector: torch.Tensor, extras: list[torch.Tensor], levels: int) -> torch.Tensor:
     """
     复刻 ngf.py 中的 positional_encoding
+    Improved: Add PI factor to ensure better frequency coverage in [-1, 1]
     """
     result = list(extras) # Copy list
-    # 原始向量也作为输入的一部分 (NGF 逻辑: result = extras, 然后 append sin/cos)
-    # ngf.py 中: result = extras; for i in range(levels): ...
-    # 注意 ngf.py 的实现并没有把 vector 本身加进去，只加了 extras 和 sin/cos 编码
+    
+    # Use torch.linspace for frequencies ensures we cover the range evenly if needed, 
+    # but 2^i is standard.
+    # We add math.pi to ensure sin(x * pi) covers a full cycle in [-1, 1]
     
     for i in range(levels):
-        k = 2 ** i
+        k = (2.0 ** i) * math.pi
         result.append(torch.sin(k * vector))
         result.append(torch.cos(k * vector))
         

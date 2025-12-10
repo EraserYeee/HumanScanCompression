@@ -41,6 +41,7 @@ class Stage2Pipeline(nn.Module):
             fine_faces: (F_fine, 3)
             displacements: (B, V_fine, 1)
             trans_feat: (B*V, K, K) or None (for regularization loss)
+            vertex_features: (B, V, D) (Debug: check variance)
         """
         # 1. Grouping
         local_points, cluster_idx = self.grouper(base_verts, base_normals, scan_points)
@@ -53,4 +54,4 @@ class Stage2Pipeline(nn.Module):
         # 3. Decoding
         fine_verts, fine_faces, displacements = self.decoder(base_verts, base_faces, vertex_features, base_normals)
 
-        return fine_verts, fine_faces, displacements, trans_feat
+        return fine_verts, fine_faces, displacements, trans_feat, vertex_features
