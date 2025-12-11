@@ -21,12 +21,16 @@ from utils.render import DifferentiableNormalRenderer
 
 # 尝试导入 PyTorch3D Loss
 try:
-    from pytorch3d.loss import mesh_laplacian_smoothing
+    from pytorch3d.loss import mesh_laplacian_smoothing, chamfer_distance
     from pytorch3d.structures import Meshes
 except ImportError:
-    print("PyTorch3D not found. Laplacian loss will be disabled.")
+    print("PyTorch3D not found. Laplacian loss and Chamfer distance will be disabled.")
     def mesh_laplacian_smoothing(meshes, method="uniform"):
         return torch.tensor(0.0, device=meshes.device)
+    def chamfer_distance(x, y, x_lengths=None, y_lengths=None, **kwargs):
+        exit()
+        return torch.tensor(0.0, device=x.device), torch.tensor(0.0, device=x.device)
+
 
 def load_config(config_path):
     with open(config_path, 'r') as f:
@@ -219,6 +223,7 @@ def train(config, args):
             
             total_loss_batch = 0
             loss_render_batch = 0
+            loss_chamfer_batch = 0
             loss_lap_batch = 0
             loss_disp_batch = 0
             loss_mat_batch = 0 # Matrix regularization loss
@@ -269,18 +274,40 @@ def train(config, args):
                         continue # Skip loss calculation for broken mesh
 
                 # Loss for this item
+                
+                # Check if using Chamfer Loss
+                loss_chamfer = torch.tensor(0.0, device=accelerator.device)
+                loss_render = torch.tensor(0.0, device=accelerator.device)
+                
+                use_chamfer = config['loss'].get('use_chamfer', False)
+                
+                if use_chamfer:
+                    # Chamfer Distance: f_verts vs b_scan
+                    # chamfer_distance returns (loss, loss_normals) or (dist1, dist2)
+                    # For pytorch3d, it returns (dist1, dist2) which are squared distances
+                    # We need to mean them
+                    print(f_verts.shape, b_scan.shape)
+                    exit()
+                    loss_chamfer, _ = chamfer_distance(f_verts, b_scan)
+                    # Also compute rendering for logging/debugging but maybe detach to save compute?
+                    # Let's compute it normally so we can see if it correlates, but weight it 0 if needed
+                
                 # 1. Render Loss
                 # Render Pred vs GT
                 # f_faces is (F_fine, 3), need (1, F_fine, 3)
                 f_faces_expanded = f_faces.unsqueeze(0)
                 
-                pred_img, gt_img = renderer(f_verts, f_faces_expanded, g_verts, g_faces)
-                
-                # Debug Export Images (Every 10 steps)
-                if should_export and accelerator.is_main_process:
-                    debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
-                
-                loss_render = torch.nn.functional.l1_loss(pred_img, gt_img)
+                if not use_chamfer or config['loss']['w_render'] > 0:
+                    pred_img, gt_img = renderer(f_verts, f_faces_expanded, g_verts, g_faces)
+                    loss_render = torch.nn.functional.l1_loss(pred_img, gt_img)
+                    
+                    # Debug Export Images (Every 10 steps)
+                    if should_export and accelerator.is_main_process:
+                        debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
+                else:
+                    # Skip rendering if only chamfer used (save time)
+                    pass
+
                 
                 # 2. Laplacian
                 # f_mesh = Meshes(verts=f_verts, faces=f_faces_expanded)
@@ -300,8 +327,21 @@ def train(config, args):
                 # w_mat: usually small, e.g. 0.001
                 w_mat = config['loss'].get('w_mat', 0.001)
                 
+                # Dynamic Weighting logic
+                if use_chamfer: 
+                    w_chamfer = config['loss']['w_chamfer']
+                    w_render=0.0
+                else:
+                    w_chamfer = 0.0
+                    w_render=config['loss']['w_render']
+                # If chamfer is ON, we might want to disable render loss or keep it
+                # For debugging "can it move?", we usually rely purely on chamfer first.
+                # Assuming if use_chamfer is True, user wants it to dominate or be the only loss unless specified otherwise.
+                # Let's keep w_render active if it's in config, user can set it to 0.0 in config if they want pure chamfer.
+                
                 loss = (
-                    config['loss']['w_render'] * loss_render +
+                    w_render * loss_render +
+                    w_chamfer * loss_chamfer +
                     config['loss']['w_laplacian'] * loss_lap +
                     config['loss']['w_disp'] * loss_disp + 
                     w_mat * loss_mat
@@ -313,17 +353,26 @@ def train(config, args):
                 # Use accelerator for backward
                 accelerator.backward(loss)
                 
-                # --- Gradient & Feature Check ---
-                if step % 10 == 0 and accelerator.is_main_process:
+                # --- Gradient & Feature Check (Debug) ---
+                if step % 20 == 0 and accelerator.is_main_process:
                     # Check Feature Embedding Statistics
                     if vertex_features is not None:
                          # vertex_features: (B, V, D)
                          # Calculate variance/std across vertices (dim=1)
                          feat_std = vertex_features.std(dim=1).mean().item()
                          feat_mean = vertex_features.mean().item()
-                         print(f"[Feat Check] Step {step}: Feature Std (across verts) = {feat_std:.6f} | Mean = {feat_mean:.6f}")
+                         feat_max = vertex_features.max().item()
+                         feat_min = vertex_features.min().item()
+                         print(f"\n[Debug] Step {step}: Feature Std={feat_std:.6f}, Mean={feat_mean:.6f}, Max={feat_max:.6f}, Min={feat_min:.6f}")
                          if feat_std < 1e-4:
                              print(f"[Warning] Feature collapse detected! Std is extremely small.")
+
+                    # Check Displacement Output
+                    if disp is not None:
+                         # disp: (B, V_fine, 1 or 3)
+                         disp_mean = disp.abs().mean().item()
+                         disp_max = disp.abs().max().item()
+                         print(f"[Debug] Step {step}: Displacement Abs Mean={disp_mean:.8f}, Max={disp_max:.8f}")
 
                     # Check Decoder output layer (Displacement predictor)
                     dec_grad_norm = 0.0
@@ -337,18 +386,19 @@ def train(config, args):
                     if dec_layer.weight.grad is not None:
                         dec_grad_norm = dec_layer.weight.grad.norm().item()
                         dec_weight_norm = dec_layer.weight.norm().item()
-                        print(f"[Grad Check] Step {step}: Decoder Last Layer Grad Norm = {dec_grad_norm:.8f} | Weight Norm = {dec_weight_norm:.8f}")
+                        print(f"[Debug] Step {step}: Decoder Last Layer Grad Norm={dec_grad_norm:.8f} | Weight Norm={dec_weight_norm:.8f}")
                         if dec_grad_norm < 1e-6:
                             print(f"[Warning] Decoder gradient is extremely small!")
 
                     # Check Encoder first layer (to see if grad flows back)
                     if enc_first.weight.grad is not None:
                          enc_grad_norm = enc_first.weight.grad.norm().item()
-                         print(f"[Grad Check] Step {step}: Encoder First Layer Grad Norm = {enc_grad_norm:.8f}")
+                         print(f"[Debug] Step {step}: Encoder First Layer Grad Norm={enc_grad_norm:.8f}")
                 # ----------------------
                 
                 total_loss_batch += loss.item()
                 loss_render_batch += loss_render.item()
+                loss_chamfer_batch += loss_chamfer.item()
                 loss_lap_batch += loss_lap.item()
                 loss_disp_batch += loss_disp.item()
                 loss_mat_batch += loss_mat.item()
@@ -371,6 +421,7 @@ def train(config, args):
                 accelerator.log({
                     "loss/total": total_loss_batch,
                     "loss/render": loss_render_batch / len(base_verts_list),
+                    "loss/chamfer": loss_chamfer_batch / len(base_verts_list),
                     "loss/laplacian": loss_lap_batch / len(base_verts_list),
                     "loss/disp": loss_disp_batch / len(base_verts_list),
                     "loss/mat": loss_mat_batch / len(base_verts_list),
@@ -380,6 +431,7 @@ def train(config, args):
                 
             pbar.set_postfix({
                 'loss': f"{total_loss_batch:.4f}",
+                'cham': f"{loss_chamfer_batch / len(base_verts_list):.4f}",
                 'rend': f"{loss_render_batch / len(base_verts_list):.4f}",
                 'mat': f"{loss_mat_batch / len(base_verts_list):.4f}"
             })

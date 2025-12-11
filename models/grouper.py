@@ -69,8 +69,9 @@ class LocalPatchGrouper(nn.Module):
        - 计算每个 Base Mesh 顶点的切空间坐标系 (TBN矩阵)。
        - 将 Scan 点从世界坐标转换到该顶点的局部坐标系。
     """
-    def __init__(self):
+    def __init__(self, use_global_coordinates=False):
         super().__init__()
+        self.use_global_coordinates = use_global_coordinates
 
     # def forward(self, base_verts: torch.Tensor, base_normals: torch.Tensor, scan_points: torch.Tensor):
     #     """
@@ -145,9 +146,26 @@ class LocalPatchGrouper(nn.Module):
         
         # 3. 计算相对位置 (Global Relative)
         delta_p = scan_points - anchor_pos # (B, P, 3)
-        
-        # 4. 直接使用相对位置作为局部坐标 (不进行旋转)
+
+        # 直接使用相对位置作为局部坐标 (不进行旋转)
         p_local = delta_p
+        
+        # # 4. 坐标变换
+        # if self.use_global_coordinates:
+        #     # 直接使用相对位置作为局部坐标 (不进行旋转)
+        #     p_local = delta_p
+        # else:
+        #     # 计算并 Gather 旋转矩阵
+        #     # 优化: 先为 V 个顶点算好 R，再 Gather 到 P 个点，比直接为 P 个点算 R 省显存
+        #     R_verts = compute_rotation_matrices(base_normals) # (B, V, 3, 3)
+            
+        #     # Gather R: (B, P, 3, 3)
+        #     R_points = R_verts[batch_indices, cluster_idx] 
+            
+        #     # 应用旋转 p_local = R @ delta_p
+        #     # R: (B, P, 3, 3), delta_p: (B, P, 3) -> (B, P, 3, 1)
+        #     # matmul: (..., 3, 3) x (..., 3, 1) -> (..., 3, 1)
+        #     p_local = torch.matmul(R_points, delta_p.unsqueeze(-1)).squeeze(-1)
         
         return p_local, cluster_idx
 

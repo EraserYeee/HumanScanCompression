@@ -38,22 +38,27 @@ class NeuralSubdivisionDecoder(nn.Module):
        - displacement = MLP(input)
        - fine_pos = lp + displacement * ln
     """
-    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4):
+    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False):
         """
         Args:
             feature_dim: 输入特征维度
             hidden_dim: MLP 隐藏层维度
             levels: Positional Encoding 的层数 (fflevels)
             rate: 细分等级 (edge subdivision rate)
+            predict_offset: If True, predict 3D offset (xyz) instead of scalar displacement
         """
         super().__init__()
         self.fflevels = levels
         self.rate = rate
+        self.predict_offset = predict_offset
         self.subdivision = BarycentricSubdivision()
         
         # MLP Input Dim calculation
         # input = lf (feature_dim) + PosEnc(lp) (3 * 2 * levels)
         self.input_dim = feature_dim + 3 * 2 * levels
+        
+        # MLP Output Dim: 1 for scalar displacement (along normal), 3 for vector offset (xyz)
+        out_dim = 3 if self.predict_offset else 1
         
         # MLP_Normal from ngf.py
         self.mlp = nn.Sequential(
@@ -63,8 +68,13 @@ class NeuralSubdivisionDecoder(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(),
-            nn.Linear(hidden_dim, 1) # Scalar displacement
+            nn.Linear(hidden_dim, out_dim)
         )
+
+        # Initialize the last layer to output near-zero values
+        # This ensures the deformation starts from the base mesh
+        nn.init.uniform_(self.mlp[-1].weight, -1e-5, 1e-5)
+        nn.init.constant_(self.mlp[-1].bias, 0)
 
     def interpolate_barycentric(self, attrs, faces, A, B):
         """
@@ -167,12 +177,18 @@ class NeuralSubdivisionDecoder(nn.Module):
         # MLP Prediction
         # Reshape for MLP: (B * F * K, input_dim)
         lin_flat = lin.view(-1, self.input_dim)
-        disp_flat = self.mlp(lin_flat) # (B*F*K, 1)
-        disp = disp_flat.view(B, -1, 1) # (B, F*K, 1)
+        disp_flat = self.mlp(lin_flat) # (B*F*K, out_dim)
         
-        # Apply Displacement
-        # v_fine = lp + d * ln
-        fine_verts = lp + disp * ln
+        if self.predict_offset:
+            # Output is (B*F*K, 3) vector offset
+            disp = disp_flat.view(B, -1, 3) # (B, F*K, 3)
+            # fine_verts = lp + disp (add offset directly)
+            fine_verts = lp + disp
+        else:
+            # Output is (B*F*K, 1) scalar displacement
+            disp = disp_flat.view(B, -1, 1) # (B, F*K, 1)
+            # fine_verts = lp + d * ln
+            fine_verts = lp + disp * ln
         
         # 4. Build Topology (for rendering)
         # fine_faces: (F*sub_faces, 3)

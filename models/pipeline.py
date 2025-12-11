@@ -11,7 +11,11 @@ class Stage2Pipeline(nn.Module):
     """
     def __init__(self, config):
         super().__init__()
-        self.grouper = LocalPatchGrouper()
+        # Check if we should predict global offset (xyz) instead of scalar displacement
+        predict_offset = config.get('predict_offset', False)
+        
+        # If predicting global offset, we use global relative coordinates in Grouper (no rotation)
+        self.grouper = LocalPatchGrouper(use_global_coordinates=predict_offset)
         
         # Check if we should use feature transform (default to True if not specified)
         use_feature_transform = config.get('use_feature_transform', True)
@@ -25,7 +29,8 @@ class Stage2Pipeline(nn.Module):
         self.decoder = NeuralSubdivisionDecoder(
             feature_dim=config.get('feature_dim', 128),
             levels=config.get('subdivision_levels', 8),
-            rate=config.get('subdivision_rate', 4)
+            rate=config.get('subdivision_rate', 4),
+            predict_offset=predict_offset
         )
 
     def forward(self, base_verts, base_faces, base_normals, scan_points):

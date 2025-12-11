@@ -16,23 +16,26 @@ data:
 
 # Model Settings
 model:
-  feature_dim: 128        # Vertex Feature Dimension
-  enc_hidden_dim: 64      # Encoder MLP Hidden Dim
-  dec_hidden_dim: 64      # Decoder MLP Hidden Dim
+  feature_dim: 256        # Vertex Feature Dimension
+  enc_hidden_dim: 128      # Encoder MLP Hidden Dim
+  dec_hidden_dim: 128      # Decoder MLP Hidden Dim
   subdivision_levels: 8   # Positional Encoding Levels
   subdivision_rate: 8     # NGF Subdivision Rate (每条边细分段数)
-  use_feature_transform: True
+  use_feature_transform: False
+  predict_offset: True   # If True, predict 3D offset (xyz) in global coordinates instead of 1D displacement along normal
 
 # Training Settings
 train:
   epochs: 200
-  lr: 1.0e-5
+  lr: 1.0e-3
   weight_decay: 1.0e-5
   save_interval: 3       # Epochs
   log_interval: 10        # Steps
   
 # Loss Weights
 loss:
+  use_chamfer: True       # Whether to use Chamfer Distance Loss (for debugging geometry)
+  w_chamfer: 100.0
   w_render: 1.0           # Normal Consistency Loss
   w_laplacian: 0.0       # Mesh Smoothness
   w_disp: 0.0           # Displacement L2 Regularization
@@ -41,6 +44,6 @@ loss:
 # Renderer Settings
 render:
   image_size: 512
-  views_per_sample: 32     # 每个样本随机渲染的视角数
+  views_per_sample: 25     # 每个样本随机渲染的视角数
   dist_multiplier: 1.2
 
