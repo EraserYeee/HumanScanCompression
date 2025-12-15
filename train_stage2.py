@@ -28,6 +28,7 @@ except ImportError:
     def mesh_laplacian_smoothing(meshes, method="uniform"):
         return torch.tensor(0.0, device=meshes.device)
     def chamfer_distance(x, y, x_lengths=None, y_lengths=None, **kwargs):
+        print("Chamfer distance not found")
         exit()
         return torch.tensor(0.0, device=x.device), torch.tensor(0.0, device=x.device)
 
@@ -134,7 +135,9 @@ def train(config, args):
         split='train',
         base_faces_min=config['data']['base_mesh_faces_min'],
         base_faces_max=config['data']['base_mesh_faces_max'],
-        backend=config['data'].get('simplification_backend', 'open3d')
+        backend=config['data'].get('simplification_backend', 'open3d'),
+        preprocessed_base_mesh_dir=config['data'].get('preprocessed_base_mesh_dir', None),
+        use_preprocess_base_mesh=config['data'].get('use_preprocess_base_mesh', False)
     )
     
     dataloader = DataLoader(
@@ -188,6 +191,30 @@ def train(config, args):
         model, optimizer, dataloader, scheduler
     )
     
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    resume_path = config.get('resume_path', None)
+    if resume_path and os.path.exists(resume_path):
+        if accelerator.is_main_process:
+            print(f"Resuming training from {resume_path}...")
+        
+        checkpoint = torch.load(resume_path, map_location='cpu')
+        
+        # Load model weights
+        # Unwrap if necessary, though accelerator usually handles loading state dict to wrapped model
+        # But here we load manually. Accelerator.load_state is for its own format.
+        # We used torch.save on unwrapped model, so we should load to unwrapped or handle prefix
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load optimizer and scheduler
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        start_epoch = checkpoint['epoch'] + 1
+        if accelerator.is_main_process:
+            print(f"Resumed from epoch {start_epoch}")
+    
     # 6. Training Loop
     epochs = config['train']['epochs']
     if accelerator.is_main_process:
@@ -195,8 +222,8 @@ def train(config, args):
     
     model.train()
     
-    step = 0
-    for epoch in range(epochs):
+    step = start_epoch * len(dataloader)
+    for epoch in range(start_epoch, epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", disable=not accelerator.is_local_main_process)
         
         t_end = time.time()
@@ -236,10 +263,11 @@ def train(config, args):
                     
                 # Single item forward
                 # Unsqueeze inputs to fake batch=1
-                b_verts = base_verts_list[b].unsqueeze(0) # (1, V, 3)
-                b_faces = base_faces_list[b].unsqueeze(0) # (1, F, 3)
-                b_normals = base_normals_list[b].unsqueeze(0)
-                b_scan = scan_points[b].unsqueeze(0) # (1, P, 3)
+                # Ensure contiguous memory for .view() operations in model
+                b_verts = base_verts_list[b].unsqueeze(0).contiguous() # (1, V, 3)
+                b_faces = base_faces_list[b].unsqueeze(0).contiguous() # (1, F, 3)
+                b_normals = base_normals_list[b].unsqueeze(0).contiguous()
+                b_scan = scan_points[b].unsqueeze(0).contiguous() # (1, P, 3)
                 
                 # Forward
                 f_verts, f_faces, disp, trans_feat, vertex_features = model(b_verts, b_faces, b_normals, b_scan)
@@ -286,8 +314,8 @@ def train(config, args):
                     # chamfer_distance returns (loss, loss_normals) or (dist1, dist2)
                     # For pytorch3d, it returns (dist1, dist2) which are squared distances
                     # We need to mean them
-                    print(f_verts.shape, b_scan.shape)
-                    exit()
+                    # print(f_verts.shape, b_scan.shape)
+                    # exit()
                     loss_chamfer, _ = chamfer_distance(f_verts, b_scan)
                     # Also compute rendering for logging/debugging but maybe detach to save compute?
                     # Let's compute it normally so we can see if it correlates, but weight it 0 if needed
@@ -460,7 +488,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/default.yaml', help="Path to config file")
     parser.add_argument('--no_wandb', action='store_true', help="Disable wandb logging")
+    parser.add_argument('--resume', type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
     config = load_config(args.config)
+    
+    # If resuming, update config with resume path if not present (or handle logic in train)
+    if args.resume:
+        config['resume_path'] = args.resume
+        
     train(config, args)

@@ -7,6 +7,8 @@ seed: 42
 data:
   data_root: "/home/ruisi/mesh_compression/data/official"
   processed_dir: "/mnt/Lab/yeruisi/data/compression/dataset_preload"  # 预处理数据存放位置
+  preprocessed_base_mesh_dir: "/mnt/Lab/yeruisi/data/compression/base_mesh_preload" # 预处理 Base Mesh 存放位置
+  use_preprocess_base_mesh: True # 是否使用预处理的 Base Mesh
   point_num: 160000       # Encoder 输入的点云数量
   batch_size: 1
   num_workers: 16
@@ -22,7 +24,7 @@ model:
   subdivision_levels: 8   # Positional Encoding Levels
   subdivision_rate: 8     # NGF Subdivision Rate (每条边细分段数)
   use_feature_transform: False
-  predict_offset: True   # If True, predict 3D offset (xyz) in global coordinates instead of 1D displacement along normal
+  predict_offset: False   # If True, predict 3D offset (xyz) in global coordinates instead of 1D displacement along normal
 
 # Training Settings
 train:
@@ -34,7 +36,7 @@ train:
   
 # Loss Weights
 loss:
-  use_chamfer: True       # Whether to use Chamfer Distance Loss (for debugging geometry)
+  use_chamfer: False       # Whether to use Chamfer Distance Loss (for debugging geometry)
   w_chamfer: 100.0
   w_render: 1.0           # Normal Consistency Loss
   w_laplacian: 0.0       # Mesh Smoothness
@@ -44,6 +46,6 @@ loss:
 # Renderer Settings
 render:
   image_size: 512
-  views_per_sample: 25     # 每个样本随机渲染的视角数
+  views_per_sample: 50     # 每个样本随机渲染的视角数
   dist_multiplier: 1.2
 
