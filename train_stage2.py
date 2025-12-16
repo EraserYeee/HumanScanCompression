@@ -46,7 +46,7 @@ def debug_export_meshes(base_v, base_f, fine_v, fine_f, gt_v, gt_f, step, batch_
     """
     导出训练过程中的 Mesh 用于调试
     """
-    save_dir = f"debug_train_meshes/step_{step:04d}_b{batch_idx}"
+    save_dir = f"/mnt/Lab/yeruisi/data/compression/debug_train_meshes/step_{step:04d}_b{batch_idx}"
     os.makedirs(save_dir, exist_ok=True)
     
     # Base Mesh
@@ -77,7 +77,7 @@ def debug_export_images(pred_img, gt_img, step, batch_idx, tag=""):
     导出渲染结果用于调试
     pred_img, gt_img: (K, H, W, 3) or (B*K, H, W, 3)
     """
-    save_dir = f"debug_train_images/step_{step:04d}_b{batch_idx}"
+    save_dir = f"/mnt/Lab/yeruisi/data/compression/debug_train_images/step_{step:04d}_b{batch_idx}"
     os.makedirs(save_dir, exist_ok=True)
     
     # Take first few views
@@ -115,7 +115,7 @@ def train(config, args):
     
     if accelerator.is_main_process:
         # Create checkpoints dir
-        ckpt_dir = os.path.join("checkpoints", run_name)
+        ckpt_dir = os.path.join("/mnt/Lab/yeruisi/data/compression/checkpoints", run_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         save_config(config, os.path.join(ckpt_dir, "config.yaml"))
 
@@ -288,7 +288,7 @@ def train(config, args):
                     is_valid = False
                 
                 # Export Debug Mesh on error OR every 10 steps
-                should_export = (step % 300 == 0 and b == 0) or (not is_valid)
+                should_export = (step % 3000 == 0 and b == 0) or (not is_valid)
                 # should_export = False
                 if should_export and accelerator.is_main_process:
                     tag = "error" if not is_valid else f"step_{step}"
@@ -382,47 +382,46 @@ def train(config, args):
                 accelerator.backward(loss)
                 
                 # --- Gradient & Feature Check (Debug) ---
-                if step % 20 == 0 and accelerator.is_main_process:
-                    # Check Feature Embedding Statistics
-                    if vertex_features is not None:
-                         # vertex_features: (B, V, D)
-                         # Calculate variance/std across vertices (dim=1)
-                         feat_std = vertex_features.std(dim=1).mean().item()
-                         feat_mean = vertex_features.mean().item()
-                         feat_max = vertex_features.max().item()
-                         feat_min = vertex_features.min().item()
-                         print(f"\n[Debug] Step {step}: Feature Std={feat_std:.6f}, Mean={feat_mean:.6f}, Max={feat_max:.6f}, Min={feat_min:.6f}")
-                         if feat_std < 1e-4:
-                             print(f"[Warning] Feature collapse detected! Std is extremely small.")
+                #     # Check Feature Embedding Statistics
+                #     if vertex_features is not None:
+                #          # vertex_features: (B, V, D)
+                #          # Calculate variance/std across vertices (dim=1)
+                #          feat_std = vertex_features.std(dim=1).mean().item()
+                #          feat_mean = vertex_features.mean().item()
+                #          feat_max = vertex_features.max().item()
+                #          feat_min = vertex_features.min().item()
+                #          print(f"\n[Debug] Step {step}: Feature Std={feat_std:.6f}, Mean={feat_mean:.6f}, Max={feat_max:.6f}, Min={feat_min:.6f}")
+                #          if feat_std < 1e-4:
+                #              print(f"[Warning] Feature collapse detected! Std is extremely small.")
 
-                    # Check Displacement Output
-                    if disp is not None:
-                         # disp: (B, V_fine, 1 or 3)
-                         disp_mean = disp.abs().mean().item()
-                         disp_max = disp.abs().max().item()
-                         print(f"[Debug] Step {step}: Displacement Abs Mean={disp_mean:.8f}, Max={disp_max:.8f}")
+                #     # Check Displacement Output
+                #     if disp is not None:
+                #          # disp: (B, V_fine, 1 or 3)
+                #          disp_mean = disp.abs().mean().item()
+                #          disp_max = disp.abs().max().item()
+                #          print(f"[Debug] Step {step}: Displacement Abs Mean={disp_mean:.8f}, Max={disp_max:.8f}")
 
-                    # Check Decoder output layer (Displacement predictor)
-                    dec_grad_norm = 0.0
-                    if hasattr(model, 'module'): # Handle DDP wrapping
-                        dec_layer = model.module.decoder.mlp[-1]
-                        enc_first = model.module.encoder.conv1[0]
-                    else:
-                        dec_layer = model.decoder.mlp[-1]
-                        enc_first = model.encoder.conv1[0]
+                #     # Check Decoder output layer (Displacement predictor)
+                #     dec_grad_norm = 0.0
+                #     if hasattr(model, 'module'): # Handle DDP wrapping
+                #         dec_layer = model.module.decoder.mlp[-1]
+                #         enc_first = model.module.encoder.conv1[0]
+                #     else:
+                #         dec_layer = model.decoder.mlp[-1]
+                #         enc_first = model.encoder.conv1[0]
                         
-                    if dec_layer.weight.grad is not None:
-                        dec_grad_norm = dec_layer.weight.grad.norm().item()
-                        dec_weight_norm = dec_layer.weight.norm().item()
-                        print(f"[Debug] Step {step}: Decoder Last Layer Grad Norm={dec_grad_norm:.8f} | Weight Norm={dec_weight_norm:.8f}")
-                        if dec_grad_norm < 1e-6:
-                            print(f"[Warning] Decoder gradient is extremely small!")
+                #     if dec_layer.weight.grad is not None:
+                #         dec_grad_norm = dec_layer.weight.grad.norm().item()
+                #         dec_weight_norm = dec_layer.weight.norm().item()
+                #         print(f"[Debug] Step {step}: Decoder Last Layer Grad Norm={dec_grad_norm:.8f} | Weight Norm={dec_weight_norm:.8f}")
+                #         if dec_grad_norm < 1e-6:
+                #             print(f"[Warning] Decoder gradient is extremely small!")
 
-                    # Check Encoder first layer (to see if grad flows back)
-                    if enc_first.weight.grad is not None:
-                         enc_grad_norm = enc_first.weight.grad.norm().item()
-                         print(f"[Debug] Step {step}: Encoder First Layer Grad Norm={enc_grad_norm:.8f}")
-                # ----------------------
+                #     # Check Encoder first layer (to see if grad flows back)
+                #     if enc_first.weight.grad is not None:
+                #          enc_grad_norm = enc_first.weight.grad.norm().item()
+                #          print(f"[Debug] Step {step}: Encoder First Layer Grad Norm={enc_grad_norm:.8f}")
+                # # ----------------------
                 
                 total_loss_batch += loss.item()
                 loss_render_batch += loss_render.item()
@@ -430,6 +429,14 @@ def train(config, args):
                 loss_lap_batch += loss_lap.item()
                 loss_disp_batch += loss_disp.item()
                 loss_mat_batch += loss_mat.item()
+                
+                # Delete large tensors to free memory immediately
+                del f_verts, f_faces, disp, trans_feat, vertex_features, b_verts, b_faces, b_normals, b_scan
+                if 'pred_img' in locals(): del pred_img
+                if 'gt_img' in locals(): del gt_img
+                if 'loss_render' in locals(): del loss_render
+                if 'loss_chamfer' in locals(): del loss_chamfer
+                del loss
             
             if torch.cuda.is_available(): torch.cuda.synchronize()
             t_forward_backward = time.time()

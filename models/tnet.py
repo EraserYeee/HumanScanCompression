@@ -3,6 +3,77 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_max
 
+class ScatterSTN3d(nn.Module):
+    """
+    Scatter version of STN3d (Spatial Transformer Network for 3D coordinates).
+    Adapts PointNet's Input Transform for flattened, variable-size point clusters.
+    """
+    def __init__(self):
+        super().__init__()
+        self.k = 3
+        
+        # Shared MLPs (applied to each point)
+        # Input: (3) -> 64 -> 128 -> 1024
+        self.conv1 = nn.Linear(3, 64)
+        self.conv2 = nn.Linear(64, 128)
+        self.conv3 = nn.Linear(128, 1024)
+        
+        # Global MLPs (applied to global feature per cluster)
+        # Input: (1024) -> 512 -> 256 -> 9
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 9)
+        
+        # BatchNorms
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
+
+    def forward(self, x, cluster_idx, total_clusters):
+        """
+        Args:
+            x: (Total_Points, 3) XYZ coordinates
+            cluster_idx: (Total_Points,) Global cluster index for each point
+            total_clusters: int (B * V), Total number of clusters (vertices)
+            
+        Returns:
+            x_transformed: (Total_Points, 3)
+            trans: (B*V, 3, 3) Transformation matrices
+        """
+        # 1. Point-wise feature extraction
+        x_local = F.relu(self.bn1(self.conv1(x)))
+        x_local = F.relu(self.bn2(self.conv2(x_local)))
+        x_local = F.relu(self.bn3(self.conv3(x_local))) # (Total_Points, 1024)
+        
+        # 2. Scatter Max Pool -> Global Feature (per cluster)
+        global_feat, _ = scatter_max(x_local, cluster_idx, dim=0, dim_size=total_clusters)
+        
+        # 3. Global MLP -> Matrix
+        g = F.relu(self.bn4(self.fc1(global_feat)))
+        g = F.relu(self.bn5(self.fc2(g)))
+        trans = self.fc3(g) # (B*V, 9)
+        
+        # 4. Reshape & Identity Add
+        trans = trans.view(-1, 3, 3)
+        
+        # Initialize as Identity
+        iden = torch.eye(3, device=x.device).view(1, 3, 3)
+        trans = trans + iden # (B*V, 3, 3)
+        
+        # 5. Broadcast back to points & Matmul
+        trans_expanded = trans[cluster_idx] 
+        
+        # Matrix Multiplication
+        # x: (Total_Points, 3) -> (Total_Points, 1, 3)
+        # trans: (Total_Points, 3, 3)
+        # result: (1, 3) @ (3, 3) -> (1, 3)
+        x_transformed = torch.matmul(x.unsqueeze(1), trans_expanded).squeeze(1)
+        
+        return x_transformed, trans
+
+
 class ScatterSTNkd(nn.Module):
     """
     Scatter version of STNkd (Spatial Transformer Network for k-dim features).

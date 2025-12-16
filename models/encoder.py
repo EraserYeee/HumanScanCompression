@@ -1,18 +1,22 @@
 import torch
 import torch.nn as nn
 from torch_scatter import scatter_max
-from .tnet import ScatterSTNkd
+from .tnet import ScatterSTNkd, ScatterSTN3d
 
 class LocalFeatureEncoder(nn.Module):
     """
     负责从分组后的局部点云中提取 Base Mesh 顶点的特征向量。
     
-    Updated: Integrated ScatterSTNkd (Feature Transform)
+    Updated: Integrated ScatterSTNkd (Feature Transform) and ScatterSTN3d (Input Transform)
     """
     def __init__(self, input_dim=3, hidden_dim=64, output_dim=128, use_feature_transform=True):
         super().__init__()
         self.output_dim = output_dim
         self.use_feature_transform = use_feature_transform
+        
+        # 0. Input Transform (STN3d)
+        if self.use_feature_transform:
+            self.istn = ScatterSTN3d()
         
         # 1. First Layer (Input -> 64)
         # PointNet: 64 dim before T-Net
@@ -68,9 +72,15 @@ class LocalFeatureEncoder(nn.Module):
         total_clusters = B * num_verts
         
         # --- PointNet Pipeline ---
+        x = flat_points
+        
+        # 0. Input Transform
+        if self.use_feature_transform:
+            # We don't regularize input transform usually
+            x, _ = self.istn(x, global_cluster_idx, total_clusters)
         
         # 1. Layer 1
-        x = self.conv1(flat_points) # (B*P, 64)
+        x = self.conv1(x) # (B*P, 64)
         
         # 2. Feature Transform
         trans_feat = None

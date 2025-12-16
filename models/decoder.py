@@ -162,21 +162,6 @@ class NeuralSubdivisionDecoder(nn.Module):
         # lp: Linear Position (B, F*K, 3)
         lp = self.interpolate_barycentric(base_verts, base_faces, uv_A, uv_B)
         
-        # Calculate bounding box or scale for normalization
-        # We normalize lp to [-1, 1] for Positional Encoding
-        # But we need to keep the original scale for displacement addition.
-        # Strategy: Pass normalized lp to PosEnc, but add displacement to original lp.
-        
-        # Compute center and scale per batch
-        # center: (B, 1, 3), scale: (B, 1, 1)
-        center = (lp.max(dim=1, keepdim=True)[0] + lp.min(dim=1, keepdim=True)[0]) / 2
-        scale = (lp.max(dim=1, keepdim=True)[0] - lp.min(dim=1, keepdim=True)[0]).max(dim=-1, keepdim=True)[0] / 2
-        
-        # Avoid division by zero
-        scale = torch.clamp(scale, min=1e-6)
-        
-        lp_norm = (lp - center) / scale
-        
         # lf: Linear Feature (B, F*K, D)
         lf = self.interpolate_barycentric(vertex_features, base_faces, uv_A, uv_B)
         
@@ -185,9 +170,9 @@ class NeuralSubdivisionDecoder(nn.Module):
         ln = F.normalize(ln, dim=-1, p=2)
         
         # 3. Neural Displacement
-        # Positional Encoding on lp_norm (Normalized!)
-        # lin = PosEnc(lp_norm) + lf
-        lin = positional_encoding(lp_norm, [lf], self.fflevels) # (B, F*K, input_dim)
+        # Positional Encoding on lp (Assumed normalized in Dataset)
+        # lin = PosEnc(lp) + lf
+        lin = positional_encoding(lp, [lf], self.fflevels) # (B, F*K, input_dim)
         
         # MLP Prediction
         # Reshape for MLP: (B * F * K, input_dim)
