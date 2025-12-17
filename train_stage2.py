@@ -348,8 +348,8 @@ def train(config, args):
                 
                 # 4. Feature Transform Regularization
                 loss_mat = torch.tensor(0.0, device=accelerator.device)
-                if trans_feat is not None:
-                    loss_mat = feature_transform_regularizer(trans_feat)
+                # if trans_feat is not None:
+                #     loss_mat = feature_transform_regularizer(trans_feat)
                 
                 # Weighted Sum
                 # w_mat: usually small, e.g. 0.001

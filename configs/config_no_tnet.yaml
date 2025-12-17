@@ -1,0 +1,39 @@
+data:
+  base_mesh_faces_max: 3000
+  base_mesh_faces_min: 1000
+  batch_size: 1
+  data_root: /home/ruisi/mesh_compression/data/official
+  num_workers: 16
+  point_num: 160000
+  preprocessed_base_mesh_dir: /mnt/Lab/yeruisi/data/compression/base_mesh_preload
+  processed_dir: /mnt/Lab/yeruisi/data/compression/dataset_preload
+  simplification_backend: pyfqmr
+  use_preprocess_base_mesh: true
+device: cuda
+experiment_name: stage2_baseline
+loss:
+  use_chamfer: false
+  w_chamfer: 100.0
+  w_disp: 0.0
+  w_laplacian: 0.0
+  w_mat: 0.001
+  w_render: 1.0
+model:
+  dec_hidden_dim: 128
+  enc_hidden_dim: 128
+  feature_dim: 256
+  predict_offset: false
+  subdivision_levels: 8
+  subdivision_rate: 8
+  use_feature_transform: false
+render:
+  dist_multiplier: 1.2
+  image_size: 512
+  views_per_sample: 100
+seed: 42
+train:
+  epochs: 200
+  log_interval: 10
+  lr: 0.00005
+  save_interval: 3
+  weight_decay: 1.0e-05
