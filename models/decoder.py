@@ -128,10 +128,9 @@ class NeuralSubdivisionDecoder(nn.Module):
             nn.Linear(hidden_dim, out_dim)
         )
 
-        # Initialize the last layer to output near-zero values
-        # This ensures the deformation starts from the base mesh
-        nn.init.uniform_(self.mlp[-1].weight, -1e-5, 1e-5)
-        nn.init.constant_(self.mlp[-1].bias, 0)
+        # Initialize the last layer to output random values (standard initialization)
+        # nn.init.uniform_(self.mlp[-1].weight, -1e-5, 1e-5)
+        # nn.init.constant_(self.mlp[-1].bias, 0)
 
     def interpolate_barycentric(self, attrs, faces, A, B):
         """
@@ -302,15 +301,12 @@ class NeuralSubdivisionDecoder(nn.Module):
             
             # Positional Encoding
             # local_pos is physically scaled (e.g. 0.01). 
-            # Ideally we might want to scale it up if it's too small, but let's stick to raw first
-            # or maybe scale by avg edge length? For now raw.
-            # pos_enc: (B, F, K, 2*3*L)
-            # We treat batch/face/k dims as flattened for encoding function if needed, 
-            # but our func handles tensor input.
+            # We scale it up significantly (e.g. * 100) to push it into the active range of PosEnc (sin/cos)
+            # This is critical for generating high-frequency details.
             
-            # Input to MLP: Concat(Feature, PosEnc(LocalPos))
+            # Input to MLP: Concat(Feature, PosEnc(LocalPos * 100))
             # list wraps feature as extras
-            mlp_in = positional_encoding(local_pos, [feat], self.fflevels) 
+            mlp_in = positional_encoding(local_pos * 100.0, [feat], self.fflevels) 
             
             # Pass through MLP
             # mlp_in: (B, F, K, InputDim) -> (B*F*K, InputDim)

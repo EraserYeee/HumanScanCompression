@@ -1,5 +1,8 @@
 import argparse
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,2"
+
 import yaml
 import time
 import torch
