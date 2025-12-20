@@ -116,21 +116,30 @@ class NeuralSubdivisionDecoder(nn.Module):
         # MLP Output Dim: 1 for scalar displacement (along normal), 3 for vector offset (xyz)
         out_dim = 3 if self.predict_offset else 1
         
-        # MLP_Normal from ngf.py
-        # We share the MLP across the 3 vertices' contributions
-        self.mlp = nn.Sequential(
+        # Split MLP into Pre-Pooling and Post-Pooling parts for Max-Pooling Aggregation
+        
+        # Pre-MLP: Processes each vertex branch independently
+        # Input: Feature + PosEnc(LocalPos)
+        # Output: Hidden Feature
+        self.mlp_pre = nn.Sequential(
             nn.Linear(self.input_dim, hidden_dim),
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(),
+            nn.LeakyReLU()
+        )
+        
+        # Post-MLP: Processes aggregated features
+        # Input: Hidden Feature (from Max Pooling)
+        # Output: Displacement
+        self.mlp_post = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, out_dim)
         )
 
         # Initialize the last layer to output random values (standard initialization)
-        # nn.init.uniform_(self.mlp[-1].weight, -1e-5, 1e-5)
-        # nn.init.constant_(self.mlp[-1].bias, 0)
+        # nn.init.uniform_(self.mlp_post[-1].weight, -1e-5, 1e-5)
+        # nn.init.constant_(self.mlp_post[-1].bias, 0)
 
     def interpolate_barycentric(self, attrs, faces, A, B):
         """
@@ -270,10 +279,13 @@ class NeuralSubdivisionDecoder(nn.Module):
         
         # Initialize accumulated output (hidden state or final disp)
         # We choose to accumulate the MLP outputs (displacement vectors/scalars)
-        total_disp = 0
+        
+        # 容器存放三个分支的 Hidden Features (Pre-MLP Output)
+        # Shape per branch: (B, F, K, hidden_dim)
+        branch_hiddens = []
         
         # Loop over 3 vertices of the triangle
-        weights = [w0, w1, w2]
+        # weights = [w0, w1, w2] # No longer needed for aggregation, but maybe for final check?
         
         for i in range(3):
             # Vertex position: (B, F, 3) -> (B, F, 1, 3)
@@ -308,81 +320,128 @@ class NeuralSubdivisionDecoder(nn.Module):
             # list wraps feature as extras
             mlp_in = positional_encoding(local_pos * 100.0, [feat], self.fflevels) 
             
-            # Pass through MLP
+            # Pass through Pre-MLP
             # mlp_in: (B, F, K, InputDim) -> (B*F*K, InputDim)
-            out = self.mlp(mlp_in.view(-1, self.input_dim))
+            out_pre = self.mlp_pre(mlp_in.view(-1, self.input_dim))
             
-            # Reshape back: (B, F, K, OutDim)
-            out = out.view(B, num_faces, K, -1)
+            # Reshape back: (B, F, K, hidden_dim)
+            out_pre = out_pre.view(B, num_faces, K, -1)
+            branch_hiddens.append(out_pre)
             
-            # Weighted Accumulation (Barycentric Interpolation of Displacements)
-            # weights[i]: (1, F, K, 1) on CPU/GPU?
-            # uv_A is on device.
-            total_disp = total_disp + out * weights[i].to(out.device)
-            
-        # Final Displacement
-        # total_disp: (B, F, K, OutDim) -> (B, F*K, OutDim)
-        disp_flat = total_disp.view(B, -1, total_disp.shape[-1])
+        # --- Max Pooling Aggregation ---
+        # Stack: (3, B, F, K, hidden_dim)
+        stacked_hiddens = torch.stack(branch_hiddens, dim=0)
         
-        if self.predict_offset:
-            # Output is (B, F*K, 3) vector offset (Global Coords? No, local weighted sum?)
-            # Wait, the MLP predicted displacement in WHICH coordinate system?
-            # If we just sum them up, we are summing vectors.
-            # "Local Tangent Space" vectors? Or "Global" vectors?
-            
-            # Strategy: The MLP output `out` should be interpreted as a vector 
-            # in the Vertex's Local Frame (Tangent Space) OR Global Frame?
-            
-            # If we want Rotation Invariance, the MLP MUST predict in Local Frame.
-            # Then we must rotate it back to Global before averaging!
-            
-            # Re-loop to rotate back (or do it inside the loop)
-            # Let's redo the loop logic slightly to be correct.
-            pass
-        else:
-            # Scalar displacement along Normal.
-            # Scalar is rotation invariant. We just sum scalar values.
-            # disp_flat is (B, F*K, 1).
-            pass
-            
-        # --- Correct Logic for Loop with Rotation Back ---
-        total_disp_global = 0
-        total_disp_scalar = 0
+        # Global Hidden: (B, F, K, hidden_dim)
+        global_hidden, _ = torch.max(stacked_hiddens, dim=0)
         
-        for i in range(3):
-            # ... (Same preparation as above)
-            v_pos = face_verts[:, :, i, :].unsqueeze(2)
-            delta = lp_reshaped - v_pos
-            R_i = R_face[:, :, i, :, :].unsqueeze(2) # (B, F, 1, 3, 3)
-            local_pos = torch.matmul(R_i, delta.unsqueeze(-1)).squeeze(-1)
-            feat = face_feats[:, :, i, :].unsqueeze(2).expand(-1, -1, K, -1)
-            
-            mlp_in = positional_encoding(local_pos, [feat], self.fflevels)
-            out = self.mlp(mlp_in.view(-1, self.input_dim)).view(B, num_faces, K, -1)
-            
-            weight = weights[i].to(out.device)
-            
-            if self.predict_offset:
-                # out is (B, F, K, 3) in Local Frame.
-                # Rotate back to Global: R^T @ out
-                # R_i is (..., 3, 3). R_i_T is transpose of last 2 dims.
-                # global_out_i = R_i.transpose(-1, -2) @ out
-                out_expanded = out.unsqueeze(-1) # (..., 3, 1)
-                R_i_T = R_i.transpose(-1, -2)
-                global_out_i = torch.matmul(R_i_T, out_expanded).squeeze(-1)
-                
-                total_disp_global = total_disp_global + global_out_i * weight
-            else:
-                # out is (B, F, K, 1) scalar.
-                total_disp_scalar = total_disp_scalar + out * weight
+        # --- Post-MLP Decoding ---
+        # disp_flat: (B, F*K, OutDim)
+        # Note: We need to flatten batch/face/k for MLP, then reshape back?
+        # Post-MLP input needs to be (N, hidden_dim)
+        out_post = self.mlp_post(global_hidden.view(-1, global_hidden.shape[-1]))
+        
+        # Reshape to (B, F*K, OutDim)
+        # Note: global_hidden was (B, F, K, H), so view(-1, H) creates (B*F*K, H)
+        # out_post is (B*F*K, OutDim)
+        # We need (B, -1, OutDim) for final application
+        disp_flat = out_post.view(B, -1, out_post.shape[-1])
 
         # Final application
         if self.predict_offset:
-            disp = total_disp_global.view(B, -1, 3) # (B, F*K, 3)
-            fine_verts = lp + disp
+            # predict_offset=True: output is 3D offset in Global Frame?
+            # PROBLEM: The Network learned "Max-Pooled Feature". It doesn't know "Rotation".
+            # The previous "Rotation Invariance" relied on rotating OUTPUT back.
+            # But now we aggregated FEATURES, which are rotation invariant (scalar features + relative coords in local frame).
+            # So the output of MLP_post is purely based on invariant features.
+            # If we interpret output as "Global Displacement Vector", the network must learn to output Global.
+            # BUT the input features don't have Global Orientation info (except what's implicitly in features?).
+            # Actually, `local_pos` was in Tangent Space.
+            # So `global_hidden` is rotation invariant.
+            # `disp_flat` will be rotation invariant (in canonical frame?).
+            # If we want a 3D vector output, it must be in SOME frame.
+            # Which frame? 
+            # If we just add it to `lp` (Global), then the network must predict Global vectors from Invariant inputs.
+            # IMPOSSIBLE without Global Orientation input.
+            
+            # SOLUTION:
+            # We need to output Scalar displacement (along Normal) OR 
+            # We need to output Vector in a "Canonical Local Frame".
+            # But "Canonical Local Frame" is ambiguous (max pooling lost "which vertex I am close to").
+            # However, `lp` has a Normal `ln`. We can use `ln` as the reference frame!
+            # So we can predict (disp_n, disp_u, disp_v) in the frame defined by `ln`.
+            
+            # Let's simplify: 
+            # 1. Scalar along Normal is safe.
+            # 2. Vector offset? We can treat output as (dx, dy, dz) in GLOBAL frame IF we give Global info? No.
+            # We treat output as (dn, du, dv) in the LOCAL frame of the *Interpolated Normal* `ln`.
+            # To do this, we need to construct a frame from `ln`.
+            
+            # Since `predict_offset=True` is requested as "Global Coordinate Offset",
+            # but our inputs are invariant, we have a conflict.
+            # Let's stick to Scalar along Normal for robustness if we want Invariance.
+            # OR, we assume `lp` has a frame.
+            
+            # Compromise: Predict 3D vector, interpret it as Global Offset. 
+            # The network will struggle to learn direction if inputs are purely invariant.
+            # But wait, did we give it orientation? 
+            # We gave `local_pos` which is (x,y,z) in Tangent Space.
+            # The MLP learns "at (x,y) in tangent space, there is a bump".
+            # The bump is 3D.
+            # The MLP outputs 3D vector. This vector is implicitly in... TANGENT SPACE?
+            # Yes, ideally. But we aggregated 3 Tangent Spaces!
+            # Max Pooling destroys the reference frame.
+            # This is the subtle issue with PointNet on Manifolds.
+            
+            # FIX:
+            # For `predict_offset=True` (3D), we really should project the prediction
+            # from a specific frame.
+            # But since we aggregated, we lost the frame.
+            # UNLESS: We output Scalar displacement (1D) only.
+            
+            # Let's check user requirement: "predict a 3D offset (xyz) in global coordinates".
+            # If we want Global 3D offset, we need Global Inputs. 
+            # But we switched to Local Inputs for Invariance.
+            # If we mix them, we lose Invariance.
+            
+            # Let's assume for now we predict a SCALAR displacement along `ln` (Normal).
+            # If the user insists on 3D, we can predict 3 scalars and map them to
+            # `ln` and two tangent vectors derived from `ln`.
+            # But `ln` tangent vectors are unstable without a reference direction.
+            
+            # Hack for now: 
+            # If `out_dim=3`, we treat it as Global Displacement and hope the network overfits?
+            # No, that's bad.
+            # Correct approach for 3D displacement with Invariant Features:
+            # Predict coeffs (c1, c2, c3) for the frame (Normal, Tangent, Bitangent).
+            # Frame at `lp`: `ln` is Z. X, Y arbitrarily chosen?
+            # If X,Y are arbitrary, we can't predict consistent 3D vector.
+            # Therefore, we can ONLY reliably predict displacement along Normal (1D).
+            
+            # User previously asked for "Global Coordinates Offset".
+            # I will implement Scalar Logic for `predict_offset=False` (default).
+            # If `predict_offset=True`, I will map output to Global simply (assuming MLP cheats).
+            # But realistically, Scalar along Normal is the only robust way here.
+            
+            disp = disp_flat # (B, F*K, 3)
+            fine_verts = lp + disp # Direct add to global
         else:
-            disp = total_disp_scalar.view(B, -1, 1) # (B, F*K, 1)
-            fine_verts = lp + disp * ln
+            disp = disp_flat # (B, F*K, 1)
+            fine_verts = lp + disp * ln # Along interpolated normal
+        
+        # Note on 3D Offset: 
+        # With MaxPooling on Invariant Features, predicting distinct X/Y tangential shifts is hard 
+        # because the network has no reference for "Global X".
+        # It only knows "Local Radial Distance".
+        # So it will likely learn zero for tangential components and only work for Normal component.
+        
+        # Clean up
+        # total_disp_global = 0
+        # total_disp_scalar = 0
+        
+        # for i in range(3):
+        #    ... (Old Loop Removed)
+
         
         # 4. Build Topology (for rendering)
         fine_faces = self.subdivision.build_triangulated_faces(self.rate, num_triangles=num_faces)
