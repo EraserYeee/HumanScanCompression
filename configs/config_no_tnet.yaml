@@ -10,7 +10,7 @@ data:
   simplification_backend: pyfqmr
   use_preprocess_base_mesh: true
 device: cuda
-experiment_name: stage2_baseline
+experiment_name: stage2_baseline_sumofdisp
 loss:
   use_chamfer: false
   w_chamfer: 100.0

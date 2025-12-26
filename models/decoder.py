@@ -109,9 +109,9 @@ class NeuralSubdivisionDecoder(nn.Module):
         self.subdivision = BarycentricSubdivision()
         
         # MLP Input Dim calculation
-        # input = lf (feature_dim) + PosEnc(relative_pos) (3 * 2 * levels)
+        # input = lf (feature_dim) + PosEnc(relative_pos) (3 * 2 * levels) + Normal (3)
         # Note: relative_pos is 3D vector, same as before
-        self.input_dim = feature_dim + 3 * 2 * levels
+        self.input_dim = feature_dim + 3 * 2 * levels + 3
         
         # MLP Output Dim: 1 for scalar displacement (along normal), 3 for vector offset (xyz)
         out_dim = 3 if self.predict_offset else 1
@@ -250,15 +250,18 @@ class NeuralSubdivisionDecoder(nn.Module):
         # We need R for each vertex of each face.
         # But compute_rotation_matrices expects (B, V, 3). 
         # We can flatten face_normals to (B*F*3, 1, 3) or just treat as (B, F*3, 3)
-        face_normals_flat = face_normals.view(B, num_faces * 3, 3)
-        R_flat = compute_rotation_matrices(face_normals_flat) # (B, F*3, 3, 3)
-        R_face = R_flat.view(B, num_faces, 3, 3, 3) # (B, F, 3vertices, 3, 3)
+        # face_normals_flat = face_normals.view(B, num_faces * 3, 3)
+        # R_flat = compute_rotation_matrices(face_normals_flat) # (B, F*3, 3, 3)
+        # R_face = R_flat.view(B, num_faces, 3, 3, 3) # (B, F, 3vertices, 3, 3)
         
         # 3.3 Prepare Inputs for MLP (for each of 3 vertices)
         # We need to process each of the K subdivision points for each Face.
         # lp: (B, F*K, 3). Reshape to (B, F, K, 3)
         K = uv_A.shape[0] // num_faces
         lp_reshaped = lp.view(B, num_faces, K, 3)
+        
+        # Reshape ln to match loop structure (B, F, K, 3)
+        ln_reshaped = ln.view(B, num_faces, K, 3)
         
         # Barycentric weights for weighted sum later
         # uv_A, uv_B: (F*K,) -> (F, K)
@@ -275,6 +278,9 @@ class NeuralSubdivisionDecoder(nn.Module):
         
         # Loop over 3 vertices of the triangle
         weights = [w0, w1, w2]
+
+        total_disp_global = 0
+        total_disp_scalar = 0
         
         for i in range(3):
             # Vertex position: (B, F, 3) -> (B, F, 1, 3)
@@ -284,21 +290,14 @@ class NeuralSubdivisionDecoder(nn.Module):
             # delta: (B, F, K, 3)
             delta = lp_reshaped - v_pos
             
-            # Rotate to Vertex Local Coords
-            # R: (B, F, 3, 3). Need (B, F, 1, 3, 3) to broadcast over K
-            # R_i = R_face[:, :, i, :, :] # (B, F, 3, 3)
-            # local_pos = (R @ delta.T).T
-            # Matmul: (..., 3, 3) @ (..., 3, 1) -> (..., 3, 1)
-            R_i = R_face[:, :, i, :, :].unsqueeze(2) # (B, F, 1, 3, 3)
-            
-            # delta: (B, F, K, 3) -> (B, F, K, 3, 1)
-            delta_expanded = delta.unsqueeze(-1)
-            
-            # local_pos: (B, F, K, 3, 1) -> squeeze -> (B, F, K, 3)
-            local_pos = torch.matmul(R_i, delta_expanded).squeeze(-1)
+            # No Rotation, just use delta (global relative pos)
+            local_pos = delta
             
             # Feature: (B, F, D) -> (B, F, K, D)
             feat = face_feats[:, :, i, :].unsqueeze(2).expand(-1, -1, K, -1)
+            
+            # Normal: (B, F, K, 3) (Subdivision Normal)
+            sub_normal = ln_reshaped
             
             # Positional Encoding
             # local_pos is physically scaled (e.g. 0.01). 
@@ -308,9 +307,9 @@ class NeuralSubdivisionDecoder(nn.Module):
             # We treat batch/face/k dims as flattened for encoding function if needed, 
             # but our func handles tensor input.
             
-            # Input to MLP: Concat(Feature, PosEnc(LocalPos))
+            # Input to MLP: Concat(Feature, PosEnc(LocalPos), Normal)
             # list wraps feature as extras
-            mlp_in = positional_encoding(local_pos, [feat], self.fflevels) 
+            mlp_in = positional_encoding(local_pos, [feat, sub_normal], self.fflevels) 
             
             # Pass through MLP
             # mlp_in: (B, F, K, InputDim) -> (B*F*K, InputDim)
@@ -320,62 +319,11 @@ class NeuralSubdivisionDecoder(nn.Module):
             out = out.view(B, num_faces, K, -1)
             
             # Weighted Accumulation (Barycentric Interpolation of Displacements)
-            # weights[i]: (1, F, K, 1) on CPU/GPU?
-            # uv_A is on device.
-            total_disp = total_disp + out * weights[i].to(out.device)
-            
-        # Final Displacement
-        # total_disp: (B, F, K, OutDim) -> (B, F*K, OutDim)
-        disp_flat = total_disp.view(B, -1, total_disp.shape[-1])
-        
-        if self.predict_offset:
-            # Output is (B, F*K, 3) vector offset (Global Coords? No, local weighted sum?)
-            # Wait, the MLP predicted displacement in WHICH coordinate system?
-            # If we just sum them up, we are summing vectors.
-            # "Local Tangent Space" vectors? Or "Global" vectors?
-            
-            # Strategy: The MLP output `out` should be interpreted as a vector 
-            # in the Vertex's Local Frame (Tangent Space) OR Global Frame?
-            
-            # If we want Rotation Invariance, the MLP MUST predict in Local Frame.
-            # Then we must rotate it back to Global before averaging!
-            
-            # Re-loop to rotate back (or do it inside the loop)
-            # Let's redo the loop logic slightly to be correct.
-            pass
-        else:
-            # Scalar displacement along Normal.
-            # Scalar is rotation invariant. We just sum scalar values.
-            # disp_flat is (B, F*K, 1).
-            pass
-            
-        # --- Correct Logic for Loop with Rotation Back ---
-        total_disp_global = 0
-        total_disp_scalar = 0
-        
-        for i in range(3):
-            # ... (Same preparation as above)
-            v_pos = face_verts[:, :, i, :].unsqueeze(2)
-            delta = lp_reshaped - v_pos
-            R_i = R_face[:, :, i, :, :].unsqueeze(2) # (B, F, 1, 3, 3)
-            local_pos = torch.matmul(R_i, delta.unsqueeze(-1)).squeeze(-1)
-            feat = face_feats[:, :, i, :].unsqueeze(2).expand(-1, -1, K, -1)
-            
-            mlp_in = positional_encoding(local_pos, [feat], self.fflevels)
-            out = self.mlp(mlp_in.view(-1, self.input_dim)).view(B, num_faces, K, -1)
-            
             weight = weights[i].to(out.device)
             
             if self.predict_offset:
-                # out is (B, F, K, 3) in Local Frame.
-                # Rotate back to Global: R^T @ out
-                # R_i is (..., 3, 3). R_i_T is transpose of last 2 dims.
-                # global_out_i = R_i.transpose(-1, -2) @ out
-                out_expanded = out.unsqueeze(-1) # (..., 3, 1)
-                R_i_T = R_i.transpose(-1, -2)
-                global_out_i = torch.matmul(R_i_T, out_expanded).squeeze(-1)
-                
-                total_disp_global = total_disp_global + global_out_i * weight
+                # out is (B, F, K, 3) in Global Relative Frame.
+                total_disp_global = total_disp_global + out * weight
             else:
                 # out is (B, F, K, 1) scalar.
                 total_disp_scalar = total_disp_scalar + out * weight
