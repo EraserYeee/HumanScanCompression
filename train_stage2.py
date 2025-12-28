@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import yaml
 import time
 import torch
@@ -46,7 +47,7 @@ def debug_export_meshes(base_v, base_f, fine_v, fine_f, gt_v, gt_f, step, batch_
     """
     导出训练过程中的 Mesh 用于调试
     """
-    save_dir = f"/mnt/Lab/yeruisi/data/compression/debug_train_meshes/step_{step:04d}_b{batch_idx}"
+    save_dir = f"/mnt/lab/data/yeruisi/data/compression/debug_train_meshes/step_{step:04d}_b{batch_idx}"
     os.makedirs(save_dir, exist_ok=True)
     
     # Base Mesh
@@ -77,7 +78,7 @@ def debug_export_images(pred_img, gt_img, step, batch_idx, tag=""):
     导出渲染结果用于调试
     pred_img, gt_img: (K, H, W, 3) or (B*K, H, W, 3)
     """
-    save_dir = f"/mnt/Lab/yeruisi/data/compression/debug_train_images/step_{step:04d}_b{batch_idx}"
+    save_dir = f"/mnt/lab/data/yeruisi/data/compression/debug_train_images/step_{step:04d}_b{batch_idx}"
     os.makedirs(save_dir, exist_ok=True)
     
     # Take first few views
@@ -115,7 +116,7 @@ def train(config, args):
     
     if accelerator.is_main_process:
         # Create checkpoints dir
-        ckpt_dir = os.path.join("/mnt/Lab/yeruisi/data/compression/checkpoints", run_name)
+        ckpt_dir = os.path.join("/mnt/lab/data/yeruisi/data/compression/checkpoints", run_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         save_config(config, os.path.join(ckpt_dir, "config.yaml"))
 
