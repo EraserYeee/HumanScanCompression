@@ -26,11 +26,15 @@ class Stage2Pipeline(nn.Module):
             output_dim=config.get('feature_dim', 128),
             use_feature_transform=use_feature_transform
         )
+        # 0: Local Pos (raw) + Normal (raw)。
+        # 1: PosEnc(Local Pos) + Normal (raw)。
+        # 2: PosEnc(Local Pos) + PosEnc(Normal)。
         self.decoder = NeuralSubdivisionDecoder(
             feature_dim=config.get('feature_dim', 128),
             levels=config.get('subdivision_levels', 8),
             rate=config.get('subdivision_rate', 4),
-            predict_offset=predict_offset
+            predict_offset=predict_offset,
+            posenc_mode=config.get('posenc_mode', 1)
         )
 
     def forward(self, base_verts, base_faces, base_normals, scan_points):

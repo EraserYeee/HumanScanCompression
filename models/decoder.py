@@ -93,7 +93,7 @@ class NeuralSubdivisionDecoder(nn.Module):
        - displacement = MLP(input)
        - fine_pos = lp + displacement * ln
     """
-    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False):
+    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False, posenc_mode=0):
         """
         Args:
             feature_dim: 输入特征维度
@@ -101,17 +101,33 @@ class NeuralSubdivisionDecoder(nn.Module):
             levels: Positional Encoding 的层数 (fflevels)
             rate: 细分等级 (edge subdivision rate)
             predict_offset: If True, predict 3D offset (xyz) instead of scalar displacement
+            posenc_mode: 0=No PE, 1=PE(LocalPos), 2=PE(LocalPos) + PE(Normal)
         """
         super().__init__()
         self.fflevels = levels
         self.rate = rate
         self.predict_offset = predict_offset
+        self.posenc_mode = posenc_mode
         self.subdivision = BarycentricSubdivision()
         
         # MLP Input Dim calculation
-        # input = lf (feature_dim) + PosEnc(relative_pos) (3 * 2 * levels) + Normal (3)
-        # Note: relative_pos is 3D vector, same as before
-        self.input_dim = feature_dim + 3 * 2 * levels + 3
+        # Base input dim: feature_dim
+        dim = feature_dim
+        
+        # Add PosEnc(local_pos)
+        if self.posenc_mode == 0:
+             dim += 3 # Just local_pos (3)
+        else:
+             dim += 3 * 2 * levels # PosEnc(local_pos)
+             
+        # Add Normal (only if predict_offset is False)
+        if not self.predict_offset:
+            if self.posenc_mode == 2:
+                dim += 3 * 2 * levels # PosEnc(normal)
+            else:
+                dim += 3 # Just normal (3)
+                
+        self.input_dim = dim
         
         # MLP Output Dim: 1 for scalar displacement (along normal), 3 for vector offset (xyz)
         out_dim = 3 if self.predict_offset else 1
@@ -307,9 +323,29 @@ class NeuralSubdivisionDecoder(nn.Module):
             # We treat batch/face/k dims as flattened for encoding function if needed, 
             # but our func handles tensor input.
             
-            # Input to MLP: Concat(Feature, PosEnc(LocalPos), Normal)
-            # list wraps feature as extras
-            mlp_in = positional_encoding(local_pos, [feat, sub_normal], self.fflevels) 
+            # Input Preparation based on posenc_mode
+            # mlp_in_list starts with feature
+            mlp_in_list = [feat]
+
+            # 1. Local Pos
+            if self.posenc_mode == 0:
+                mlp_in_list.append(local_pos)
+            else:
+                # Mode 1 or 2: Apply PosEnc to local_pos
+                pe_pos = positional_encoding(local_pos, [], self.fflevels)
+                mlp_in_list.append(pe_pos)
+
+            # 2. Normal (only if not predicting offset)
+            if not self.predict_offset:
+                if self.posenc_mode == 2:
+                    pe_norm = positional_encoding(sub_normal, [], self.fflevels)
+                    mlp_in_list.append(pe_norm)
+                else:
+                    # Mode 0 or 1: Just append raw normal
+                    mlp_in_list.append(sub_normal)
+
+            # Concatenate all inputs
+            mlp_in = torch.cat(mlp_in_list, dim=-1)
             
             # Pass through MLP
             # mlp_in: (B, F, K, InputDim) -> (B*F*K, InputDim)
