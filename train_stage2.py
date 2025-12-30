@@ -154,14 +154,7 @@ def train(config, args):
     if accelerator.is_main_process:
         print("Initializing model...")
         
-    model = Stage2Pipeline(config={
-        'feature_dim': config['model']['feature_dim'],
-        'enc_hidden_dim': config['model']['enc_hidden_dim'],
-        'dec_hidden_dim': config['model']['dec_hidden_dim'],
-        'subdivision_levels': config['model']['subdivision_levels'],
-        'subdivision_rate': config['model']['subdivision_rate'],
-        'use_feature_transform': config['model'].get('use_feature_transform', True)
-    })
+    model = Stage2Pipeline(config=config['model'])
     # No need for .to(device), accelerate handles it
     
     # 4. Setup Renderer (Loss)
