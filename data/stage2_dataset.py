@@ -26,7 +26,8 @@ class ScanToMeshDataset(Dataset):
     def __init__(self, data_root, split='train', point_num=320000, 
                  base_faces_min=2000, base_faces_max=6000, 
                  backend='open3d', debug_export=False,
-                 preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False):
+                 preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False, 
+                 preload_ram=False, lmdb_path=None):
         """
         Args:
             data_root: 预处理数据目录
@@ -36,6 +37,8 @@ class ScanToMeshDataset(Dataset):
             debug_export: 是否导出第0个样本的中间结果用于检查
             preprocessed_base_mesh_dir: Base Mesh 预处理目录 (可选)
             use_preprocess_base_mesh: 是否使用预处理的 Base Mesh
+            preload_ram: 是否将所有数据预加载到内存中 (解决 IO 瓶颈)
+            lmdb_path: 预打包的 LMDB 数据库路径 (推荐使用)
         """
         self.data_root = data_root
         self.split = split
@@ -45,6 +48,9 @@ class ScanToMeshDataset(Dataset):
         self.debug_export = debug_export
         self.use_preprocess_base_mesh = use_preprocess_base_mesh
         self.preprocessed_base_mesh_dir = preprocessed_base_mesh_dir
+        self.preload_ram = preload_ram
+        self.lmdb_path = lmdb_path
+        self.lmdb_env = None
         
         if self.backend == 'pyfqmr' and not _HAS_PYFQMR:
             print("[Warning] pyfqmr not found, falling back to open3d")
@@ -93,6 +99,71 @@ class ScanToMeshDataset(Dataset):
             
         print(f"[Dataset] Loaded {len(self.file_list)} samples for {split} | Backend: {self.backend} | Preprocessed Base: {self.use_preprocess_base_mesh}")
 
+        # --- LMDB Setup ---
+        if self.lmdb_path and os.path.exists(self.lmdb_path):
+             import lmdb
+             # Open read-only, no lock
+             self.lmdb_env = lmdb.open(self.lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
+             print(f"[Dataset] Using LMDB: {self.lmdb_path}")
+
+        # --- Preload to RAM ---
+        self.gt_cache = {}
+        self.base_cache = {}
+        
+        # Only preload if NOT using LMDB (or if user explicitly wants to load LMDB into RAM which is usually unnecessary as OS does it)
+        # But if preload_ram is True, we can load FROM LMDB to RAM to be even faster.
+        if self.preload_ram:
+             from tqdm import tqdm
+             if self.lmdb_env:
+                 print("[Dataset] Preloading all data from LMDB to RAM...")
+                 import pickle
+                 with self.lmdb_env.begin(write=False) as txn:
+                     # Load GT
+                     for i in tqdm(range(len(self.file_list))):
+                         key = f"gt_{i}".encode()
+                         buf = txn.get(key)
+                         if buf:
+                             pt_path = os.path.join(self.data_root, self.file_list[i]['pt_path'])
+                             self.gt_cache[pt_path] = pickle.loads(buf)
+                     
+                     # Load Base
+                     if self.use_preprocess_base_mesh and self.base_file_list:
+                         for entry in tqdm(self.base_file_list):
+                             rel_path = entry['base_pt_path']
+                             key = f"base_{rel_path}".encode()
+                             buf = txn.get(key)
+                             if buf:
+                                 full_path = os.path.join(self.preprocessed_base_mesh_dir, rel_path)
+                                 self.base_cache[full_path] = pickle.loads(buf)
+                 print(f"[Dataset] LMDB Preload complete.")
+                 
+             else:
+                print("[Dataset] Preloading all data to RAM from DISK... This may take a while.")
+                from tqdm import tqdm
+                
+                # 1. Preload GT
+                print("  - Loading GT Meshes...")
+                for item in tqdm(self.file_list):
+                    pt_path = os.path.join(self.data_root, item['pt_path'])
+                    if pt_path not in self.gt_cache:
+                        try:
+                            self.gt_cache[pt_path] = torch.load(pt_path, weights_only=False)
+                        except Exception as e:
+                            print(f"[Warning] Failed to load {pt_path}: {e}")
+                
+                # 2. Preload Base (if used)
+                if self.use_preprocess_base_mesh and self.base_file_list:
+                    print("  - Loading Base Meshes...")
+                    for entry in tqdm(self.base_file_list):
+                        base_pt_full_path = os.path.join(self.preprocessed_base_mesh_dir, entry['base_pt_path'])
+                        if base_pt_full_path not in self.base_cache:
+                            try:
+                                self.base_cache[base_pt_full_path] = torch.load(base_pt_full_path, weights_only=False)
+                            except Exception as e:
+                                print(f"[Warning] Failed to load {base_pt_full_path}: {e}")
+                                
+                print(f"[Dataset] Preload complete. GT Cache: {len(self.gt_cache)}, Base Cache: {len(self.base_cache)}")
+
     def __len__(self):
         return len(self.file_list)
 
@@ -103,7 +174,21 @@ class ScanToMeshDataset(Dataset):
         
         # Load GT Data
         # GT Data is needed for sampling scan points (always)
-        data = torch.load(pt_path, weights_only=False)
+        if self.preload_ram and pt_path in self.gt_cache:
+            data = self.gt_cache[pt_path]
+        elif self.lmdb_env:
+            import pickle
+            with self.lmdb_env.begin(write=False) as txn:
+                key = f"gt_{idx}".encode()
+                buf = txn.get(key)
+                if buf:
+                    data = pickle.loads(buf)
+                else:
+                    # Fallback
+                    data = torch.load(pt_path, weights_only=False)
+        else:
+            data = torch.load(pt_path, weights_only=False)
+            
         gt_verts_np = data['gt_verts'].numpy()
         gt_faces_np = data['gt_faces'].numpy()
         
@@ -155,7 +240,20 @@ class ScanToMeshDataset(Dataset):
                 base_pt_full_path = os.path.join(self.preprocessed_base_mesh_dir, selected['base_pt_path'])
                 
                 try:
-                    base_data = torch.load(base_pt_full_path, weights_only=False)
+                    if self.preload_ram and base_pt_full_path in self.base_cache:
+                        base_data = self.base_cache[base_pt_full_path]
+                    elif self.lmdb_env:
+                         import pickle
+                         with self.lmdb_env.begin(write=False) as txn:
+                             key = f"base_{selected['base_pt_path']}".encode()
+                             buf = txn.get(key)
+                             if buf:
+                                 base_data = pickle.loads(buf)
+                             else:
+                                 base_data = torch.load(base_pt_full_path, weights_only=False)
+                    else:
+                        base_data = torch.load(base_pt_full_path, weights_only=False)
+                        
                     base_verts_np = base_data['base_verts'].numpy().astype(np.float32)
                     base_faces_np = base_data['base_faces'].numpy().astype(np.int64)
                     

@@ -3,10 +3,12 @@ data:
   base_mesh_faces_min: 1000
   batch_size: 1
   data_root: /home/ruisi/mesh_compression/data/official
-  num_workers: 4
+  num_workers: 2
   point_num: 1280000
+  preload_ram: false
   preprocessed_base_mesh_dir: /mnt/lab/data/yeruisi/data/compression/base_mesh_preload
   processed_dir: /mnt/lab/data/yeruisi/data/compression/dataset_preload
+  lmdb_path: /mnt/lab/data/yeruisi/data/compression/train_data.lmdb
   simplification_backend: pyfqmr
   use_preprocess_base_mesh: true
 device: cuda

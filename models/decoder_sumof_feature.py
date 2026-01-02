@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from utils.subdivision import BarycentricSubdivision
+from torch_scatter import scatter_mean
 
 def positional_encoding(vector: torch.Tensor, extras: list[torch.Tensor], levels: int) -> torch.Tensor:
     """
@@ -34,6 +35,9 @@ class SumOfFeatureDecoder(nn.Module):
     3. Predict displacement from aggregated feature:
        - d = MLP_G(H, PosEnc(n_lin))  [if predict_scalar]
        - d = MLP_G(H)                 [if predict_offset, no normal]
+    4. Stitch Seams (New):
+       - Identify shared subdivision points on edges/vertices.
+       - Average the predicted displacements d for these shared points.
        
     Args:
         feature_dim: Dimension of input vertex features
@@ -233,10 +237,40 @@ class SumOfFeatureDecoder(nn.Module):
         # Reshape back: (B, F, K, OutDim)
         out = out.view(B, num_faces, K, -1)
         
-        # 5. Apply Displacement
         # Flatten to (B, F*K, OutDim)
         disp_flat = out.view(B, -1, out.shape[-1])
         
+        # 5. Stitch Seams: Average displacements for shared points
+        # Compute merge indices using topology
+        # merge_idx: (B, F*K) values in [0, Num_Unique-1]
+        merge_idx = self.subdivision.compute_merge_indices(base_faces, self.rate)
+        
+        # Compute averaged displacements
+        # disp_flat: (B, N, D)
+        # merge_idx: (B, N)
+        # We need to flatten Batch dim for scatter_mean, then reshape back
+        # But compute_merge_indices already handles batch offset internally for "unique values" logic?
+        # WAIT. My compute_merge_indices returns (B, F*K) where indices are LOCAL to each batch item?
+        # Let's check compute_merge_indices implementation:
+        # It calls `torch.unique` on keys offset by batch. So the indices returned by `return_inverse` 
+        # are GLOBAL indices across the whole batch [0, Total_Unique_Across_Batch - 1].
+        # So we can just flatten disp and use flattened merge_idx.
+        
+        disp_all = disp_flat.view(-1, disp_flat.shape[-1]) # (B*N, D)
+        idx_all = merge_idx.view(-1) # (B*N,)
+        
+        # Scatter Mean
+        # averaged_disp_unique: (Total_Unique, D)
+        averaged_disp_unique = scatter_mean(disp_all, idx_all, dim=0)
+        
+        # Map back to full points
+        # disp_stitched: (B*N, D)
+        disp_stitched = averaged_disp_unique[idx_all]
+        
+        # Reshape to (B, F*K, D)
+        disp_flat = disp_stitched.view(B, -1, disp_flat.shape[-1])
+        
+        # 6. Apply Displacement
         if self.predict_offset:
             # Vector offset
             fine_verts = lp + disp_flat
@@ -248,5 +282,3 @@ class SumOfFeatureDecoder(nn.Module):
         fine_faces = self.subdivision.build_triangulated_faces(self.rate, num_triangles=num_faces)
         
         return fine_verts, fine_faces, disp_flat
-
-

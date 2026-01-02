@@ -138,7 +138,9 @@ def train(config, args):
         base_faces_max=config['data']['base_mesh_faces_max'],
         backend=config['data'].get('simplification_backend', 'open3d'),
         preprocessed_base_mesh_dir=config['data'].get('preprocessed_base_mesh_dir', None),
-        use_preprocess_base_mesh=config['data'].get('use_preprocess_base_mesh', False)
+        use_preprocess_base_mesh=config['data'].get('use_preprocess_base_mesh', False),
+        preload_ram=config['data'].get('preload_ram', False), # Controlled by config
+        lmdb_path=config['data'].get('lmdb_path', None)
     )
     
     dataloader = DataLoader(

@@ -53,8 +53,8 @@ class Stage2Pipeline(nn.Module):
             # 1: PosEnc(Local Pos) + Normal (raw)。
             # 2: PosEnc(Local Pos) + PosEnc(Normal)。
             self.decoder = NeuralSubdivisionDecoder(
-                hidden_dim=config.get('dec_hidden_dim', 64),
-                **common_kwargs
+                    hidden_dim=config.get('dec_hidden_dim', 64),
+                    **common_kwargs
             )
 
     def forward(self, base_verts, base_faces, base_normals, scan_points):
