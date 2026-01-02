@@ -1,7 +1,7 @@
 data:
   base_mesh_faces_max: 3000
   base_mesh_faces_min: 1000
-  batch_size: 1
+  batch_size: 4
   data_root: /home/ruisi/mesh_compression/data/official
   num_workers: 2
   point_num: 1280000
@@ -24,7 +24,7 @@ model:
   dec_hidden_dim: 128
   enc_hidden_dim: 128
   feature_dim: 256
-  predict_offset: false
+  predict_offset: true
   subdivision_levels: 8
   subdivision_rate: 12
   use_feature_transform: false

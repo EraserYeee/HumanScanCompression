@@ -132,22 +132,30 @@ class NeuralSubdivisionDecoder(nn.Module):
         # MLP Output Dim: 1 for scalar displacement (along normal), 3 for vector offset (xyz)
         out_dim = 3 if self.predict_offset else 1
         
-        # MLP_Normal from ngf.py
-        # We share the MLP across the 3 vertices' contributions
-        self.mlp = nn.Sequential(
+        # Split MLP into Pre-Pooling and Post-Pooling parts for Max-Pooling Aggregation
+        
+        # Pre-MLP: Processes each vertex branch independently
+        # Input: Feature + PosEnc(LocalPos)
+        # Output: Hidden Feature
+        self.mlp_pre = nn.Sequential(
             nn.Linear(self.input_dim, hidden_dim),
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(),
+            nn.LeakyReLU()
+        )
+        
+        # Post-MLP: Processes aggregated features
+        # Input: Hidden Feature (from Max Pooling)
+        # Output: Displacement
+        self.mlp_post = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, out_dim)
         )
 
-        # Initialize the last layer to output near-zero values
-        # This ensures the deformation starts from the base mesh
-        nn.init.uniform_(self.mlp[-1].weight, -1e-5, 1e-5)
-        nn.init.constant_(self.mlp[-1].bias, 0)
+        # Initialize the last layer to output random values (standard initialization)
+        # nn.init.uniform_(self.mlp_post[-1].weight, -1e-5, 1e-5)
+        # nn.init.constant_(self.mlp_post[-1].bias, 0)
 
     def interpolate_barycentric(self, attrs, faces, A, B):
         """
@@ -290,7 +298,10 @@ class NeuralSubdivisionDecoder(nn.Module):
         
         # Initialize accumulated output (hidden state or final disp)
         # We choose to accumulate the MLP outputs (displacement vectors/scalars)
-        total_disp = 0
+        
+        # 容器存放三个分支的 Hidden Features (Pre-MLP Output)
+        # Shape per branch: (B, F, K, hidden_dim)
+        branch_hiddens = []
         
         # Loop over 3 vertices of the triangle
         weights = [w0, w1, w2]
@@ -317,11 +328,8 @@ class NeuralSubdivisionDecoder(nn.Module):
             
             # Positional Encoding
             # local_pos is physically scaled (e.g. 0.01). 
-            # Ideally we might want to scale it up if it's too small, but let's stick to raw first
-            # or maybe scale by avg edge length? For now raw.
-            # pos_enc: (B, F, K, 2*3*L)
-            # We treat batch/face/k dims as flattened for encoding function if needed, 
-            # but our func handles tensor input.
+            # We scale it up significantly (e.g. * 100) to push it into the active range of PosEnc (sin/cos)
+            # This is critical for generating high-frequency details.
             
             # Input Preparation based on posenc_mode
             # mlp_in_list starts with feature
@@ -347,12 +355,9 @@ class NeuralSubdivisionDecoder(nn.Module):
             # Concatenate all inputs
             mlp_in = torch.cat(mlp_in_list, dim=-1)
             
-            # Pass through MLP
+            # Pass through Pre-MLP
             # mlp_in: (B, F, K, InputDim) -> (B*F*K, InputDim)
-            out = self.mlp(mlp_in.view(-1, self.input_dim))
-            
-            # Reshape back: (B, F, K, OutDim)
-            out = out.view(B, num_faces, K, -1)
+            out_pre = self.mlp_pre(mlp_in.view(-1, self.input_dim))
             
             # Weighted Accumulation (Barycentric Interpolation of Displacements)
             weight = weights[i].to(out.device)
@@ -369,8 +374,22 @@ class NeuralSubdivisionDecoder(nn.Module):
             disp = total_disp_global.view(B, -1, 3) # (B, F*K, 3)
             fine_verts = lp + disp
         else:
-            disp = total_disp_scalar.view(B, -1, 1) # (B, F*K, 1)
-            fine_verts = lp + disp * ln
+            disp = disp_flat # (B, F*K, 1)
+            fine_verts = lp + disp * ln # Along interpolated normal
+        
+        # Note on 3D Offset: 
+        # With MaxPooling on Invariant Features, predicting distinct X/Y tangential shifts is hard 
+        # because the network has no reference for "Global X".
+        # It only knows "Local Radial Distance".
+        # So it will likely learn zero for tangential components and only work for Normal component.
+        
+        # Clean up
+        # total_disp_global = 0
+        # total_disp_scalar = 0
+        
+        # for i in range(3):
+        #    ... (Old Loop Removed)
+
         
         # 4. Build Topology (for rendering)
         fine_faces = self.subdivision.build_triangulated_faces(self.rate, num_triangles=num_faces)
