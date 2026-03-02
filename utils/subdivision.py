@@ -6,11 +6,12 @@ class BarycentricSubdivision:
     基于重心坐标采样的网格细分工具类。
     复刻 NGF 中的 sample_uniform_bary 和 build_triangulated_faces 逻辑。
     """
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', max_cache_size=32):
         self.uv_cache = {}
         self.face_cache = {} # cache faces for each (rate, num_triangles)
         self.merge_idx_cache = {} # Cache merge indices for seams stitching
         self.device = device
+        self.max_cache_size = max_cache_size
 
     def sample_uniform_bary(self, rate: int, num_triangles: int):
         """
@@ -58,6 +59,10 @@ class BarycentricSubdivision:
         A = A.repeat(num_triangles)
         B = B.repeat(num_triangles)
         
+        # Evict oldest entries if cache is full to prevent unbounded GPU memory growth
+        if len(self.uv_cache) >= self.max_cache_size:
+            oldest_key = next(iter(self.uv_cache))
+            del self.uv_cache[oldest_key]
         self.uv_cache[cache_key] = (A, B)
         return A, B
 
@@ -128,6 +133,10 @@ class BarycentricSubdivision:
         faces = single_tri_faces.unsqueeze(0) + offsets
         faces = faces.view(-1, 3) # (Nt * M, 3)
         
+        # Evict oldest entries if cache is full to prevent unbounded GPU memory growth
+        if len(self.face_cache) >= self.max_cache_size:
+            oldest_key = next(iter(self.face_cache))
+            del self.face_cache[oldest_key]
         self.face_cache[cache_key] = faces
         return faces
 

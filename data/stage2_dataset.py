@@ -27,7 +27,7 @@ class ScanToMeshDataset(Dataset):
                  base_faces_min=2000, base_faces_max=6000, 
                  backend='open3d', debug_export=False,
                  preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False, 
-                 preload_ram=False, lmdb_path=None):
+                 preload_ram=False, lmdb_path=None, use_scan_normal=False):
         """
         Args:
             data_root: 预处理数据目录
@@ -50,6 +50,7 @@ class ScanToMeshDataset(Dataset):
         self.preprocessed_base_mesh_dir = preprocessed_base_mesh_dir
         self.preload_ram = preload_ram
         self.lmdb_path = lmdb_path
+        self.use_scan_normal = use_scan_normal
         self.lmdb_env = None
         
         if self.backend == 'pyfqmr' and not _HAS_PYFQMR:
@@ -211,8 +212,12 @@ class ScanToMeshDataset(Dataset):
         
         # 1. Online Sampling (Trimesh is good for sampling)
         tm_mesh = trimesh.Trimesh(vertices=gt_verts_np, faces=gt_faces_np, process=False)
-        scan_points, _ = trimesh.sample.sample_surface(tm_mesh, self.point_num)
+        scan_points, sampled_face_idx = trimesh.sample.sample_surface(tm_mesh, self.point_num)
         scan_points = scan_points.astype(np.float32)
+        scan_normals = None
+        if self.use_scan_normal:
+            # Use source face normals from fine mesh (not estimated from sampled point cloud).
+            scan_normals = tm_mesh.face_normals[sampled_face_idx].astype(np.float32)
         t2 = time.time()
         
         base_verts_np = None
@@ -318,21 +323,21 @@ class ScanToMeshDataset(Dataset):
             
             # print(f"[Dataset Worker] Idx {idx}: Total {t3-t0:.4f}s | Load {t1-t0:.4f}s | Sample {t2-t1:.4f}s | Simplify ({self.backend}) {t3-t2:.4f}s")
         
-        # Debug Export (First item only)
-        if self.debug_export and idx == 0:
-            os.makedirs("debug_dataset", exist_ok=True)
-            # For saving, reuse Open3D
-            dbg_mesh = o3d.geometry.TriangleMesh()
-            dbg_mesh.vertices = o3d.utility.Vector3dVector(base_verts_np)
-            dbg_mesh.triangles = o3d.utility.Vector3iVector(base_faces_np.astype(np.int32))
-            o3d.io.write_triangle_mesh("debug_dataset/base_mesh_debug.obj", dbg_mesh)
+        # # Debug Export (First item only)
+        # if self.debug_export and idx == 0:
+        #     os.makedirs("debug_dataset", exist_ok=True)
+        #     # For saving, reuse Open3D
+        #     dbg_mesh = o3d.geometry.TriangleMesh()
+        #     dbg_mesh.vertices = o3d.utility.Vector3dVector(base_verts_np)
+        #     dbg_mesh.triangles = o3d.utility.Vector3iVector(base_faces_np.astype(np.int32))
+        #     o3d.io.write_triangle_mesh("debug_dataset/base_mesh_debug.obj", dbg_mesh)
             
-            pc = o3d.geometry.PointCloud()
-            pc.points = o3d.utility.Vector3dVector(scan_points)
-            o3d.io.write_point_cloud("debug_dataset/scan_points_debug.ply", pc)
-            print(f"[Dataset Debug] Exported base mesh (V={len(base_verts_np)}, F={len(base_faces_np)}) and scan points.")
+        #     pc = o3d.geometry.PointCloud()
+        #     pc.points = o3d.utility.Vector3dVector(scan_points)
+        #     o3d.io.write_point_cloud("debug_dataset/scan_points_debug.ply", pc)
+        #     print(f"[Dataset Debug] Exported base mesh (V={len(base_verts_np)}, F={len(base_faces_np)}) and scan points.")
         
-        return {
+        result = {
             'scan_points': torch.from_numpy(scan_points), # (P, 3)
             'base_verts': torch.from_numpy(base_verts_np), # (V, 3)
             'base_faces': torch.from_numpy(base_faces_np), # (F, 3)
@@ -340,6 +345,9 @@ class ScanToMeshDataset(Dataset):
             'gt_verts': torch.from_numpy(gt_verts_np), # Need to return normalized GT!
             'gt_faces': data['gt_faces'] # Faces unchanged
         }
+        if self.use_scan_normal and scan_normals is not None:
+            result['scan_normals'] = torch.from_numpy(scan_normals)  # (P, 3)
+        return result
 
 def stage2_collate_fn(batch):
     """
@@ -348,6 +356,8 @@ def stage2_collate_fn(batch):
     Meshes are kept as lists (or could be packed Meshes).
     """
     scan_points = torch.stack([item['scan_points'] for item in batch])
+    has_scan_normal = ('scan_normals' in batch[0])
+    scan_normals = torch.stack([item['scan_normals'] for item in batch]) if has_scan_normal else None
     
     base_verts_list = [item['base_verts'] for item in batch]
     base_faces_list = [item['base_faces'] for item in batch]
@@ -356,7 +366,7 @@ def stage2_collate_fn(batch):
     gt_verts_list = [item['gt_verts'] for item in batch]
     gt_faces_list = [item['gt_faces'] for item in batch]
     
-    return {
+    result = {
         'scan_points': scan_points,
         'base_verts': base_verts_list,
         'base_faces': base_faces_list,
@@ -364,3 +374,6 @@ def stage2_collate_fn(batch):
         'gt_verts': gt_verts_list,
         'gt_faces': gt_faces_list
     }
+    if has_scan_normal:
+        result['scan_normals'] = scan_normals
+    return result

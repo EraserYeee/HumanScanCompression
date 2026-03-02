@@ -187,13 +187,20 @@ class DifferentiableNormalRenderer(nn.Module):
         pred_normals = torch.nn.functional.normalize(pred_normals, dim=-1)
         pred_normals = dr.antialias(pred_normals, rast, v_clip, faces_expanded)
         
+        # Extract Depth from rasterization output
+        # rast[..., 2] contains the depth (z) in NDC space
+        # Convert from NDC depth to world depth if needed, or use directly
+        pred_depth = rast[..., 2:3]  # (BK, H, W, 1)
+        
         # Background masking
         # rast[..., 3] > 0 means valid
         mask = rast[..., 3:4] > 0
         pred_img = pred_normals * mask # 0 for bg
+        pred_depth = pred_depth * mask  # 0 for bg
         
         # GT Render
         gt_img = None
+        gt_depth = None
         if gt_verts is not None and gt_faces is not None:
             # Prepare GT
             gt_verts_ex = gt_verts.unsqueeze(1).expand(-1, K, -1, -1).reshape(total_batch, -1, 3)
@@ -221,8 +228,11 @@ class DifferentiableNormalRenderer(nn.Module):
             
             gt_mask = gt_rast[..., 3:4] > 0
             gt_img = gt_normals * gt_mask
+            gt_depth = gt_rast[..., 2:3] * gt_mask  # Extract depth
+        else:
+            gt_depth = None
             
-        return pred_img, gt_img
+        return pred_img, gt_img, pred_depth, gt_depth
 
     def compute_vertex_normals(self, verts, faces):
         """

@@ -18,11 +18,16 @@ class Stage2Pipeline(nn.Module):
         # If predicting global offset, we use global relative coordinates in Grouper (no rotation)
         self.grouper = LocalPatchGrouper(use_global_coordinates=predict_offset)
         
+        # Optional extra scan feature
+        self.use_scan_normal = config.get('use_scan_normal', False)
+
         # Check if we should use feature transform (default to True if not specified)
         use_feature_transform = config.get('use_feature_transform', True)
+
+        enc_input_dim = 6 if self.use_scan_normal else 3
         
         self.encoder = LocalFeatureEncoder(
-            input_dim=3, 
+            input_dim=enc_input_dim, 
             hidden_dim=config.get('enc_hidden_dim', 64),
             output_dim=config.get('feature_dim', 128),
             use_feature_transform=use_feature_transform
@@ -35,12 +40,16 @@ class Stage2Pipeline(nn.Module):
         print("Model config keys:", config.keys())
         print(f"Decoder Type Selected: {decoder_type}")
         
+        # Initialization mode: 'near_zero' or 'random'
+        init_mode = config.get('init_mode', 'near_zero')
+        
         common_kwargs = {
             'feature_dim': config.get('feature_dim', 128),
             'levels': config.get('subdivision_levels', 8),
             'rate': config.get('subdivision_rate', 4),
             'predict_offset': predict_offset,
-            'posenc_mode': config.get('posenc_mode', 1)
+            'posenc_mode': config.get('posenc_mode', 1),
+            'init_mode': init_mode
         }
         
         if decoder_type == 'sum_of_feature':
@@ -57,13 +66,14 @@ class Stage2Pipeline(nn.Module):
                     **common_kwargs
             )
 
-    def forward(self, base_verts, base_faces, base_normals, scan_points):
+    def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None):
         """
         Args:
             base_verts: (B, V, 3)
             base_faces: (B, F, 3)
             base_normals: (B, V, 3)
             scan_points: (B, P, 3)
+            scan_normals: (B, P, 3) or None
 
         Returns:
             fine_verts: (B, V_fine, 3)
@@ -78,7 +88,10 @@ class Stage2Pipeline(nn.Module):
         # 2. Encoding
         # 注意: num_verts 需要处理 batch 内可能不一致的情况，通常取 max
         B, V, _ = base_verts.shape
-        vertex_features, trans_feat = self.encoder(local_points, cluster_idx, num_verts=V)
+        encoder_input = local_points
+        if self.use_scan_normal and scan_normals is not None:
+            encoder_input = torch.cat([encoder_input, scan_normals], dim=-1)
+        vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
 
         # 3. Decoding
         fine_verts, fine_faces, displacements = self.decoder(base_verts, base_faces, vertex_features, base_normals)

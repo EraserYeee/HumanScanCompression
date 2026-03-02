@@ -93,7 +93,7 @@ class NeuralSubdivisionDecoder(nn.Module):
        - displacement = MLP(input)
        - fine_pos = lp + displacement * ln
     """
-    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False, posenc_mode=0):
+    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False, posenc_mode=0, init_mode='near_zero'):
         """
         Args:
             feature_dim: 输入特征维度
@@ -102,12 +102,14 @@ class NeuralSubdivisionDecoder(nn.Module):
             rate: 细分等级 (edge subdivision rate)
             predict_offset: If True, predict 3D offset (xyz) instead of scalar displacement
             posenc_mode: 0=No PE, 1=PE(LocalPos), 2=PE(LocalPos) + PE(Normal)
+            init_mode: 'near_zero' or 'random' initialization for last layer
         """
         super().__init__()
         self.fflevels = levels
         self.rate = rate
         self.predict_offset = predict_offset
         self.posenc_mode = posenc_mode
+        self.init_mode = init_mode
         self.subdivision = BarycentricSubdivision()
         
         # MLP Input Dim calculation
@@ -153,9 +155,15 @@ class NeuralSubdivisionDecoder(nn.Module):
             nn.Linear(hidden_dim, out_dim)
         )
 
-        # Initialize the last layer to output random values (standard initialization)
-        # nn.init.uniform_(self.mlp_post[-1].weight, -1e-5, 1e-5)
-        # nn.init.constant_(self.mlp_post[-1].bias, 0)
+        # Initialize the last layer based on init_mode
+        if self.init_mode == 'near_zero':
+            nn.init.uniform_(self.mlp_post[-1].weight, -1e-5, 1e-5)
+            nn.init.constant_(self.mlp_post[-1].bias, 0)
+        elif self.init_mode == 'random':
+            # Use PyTorch default initialization (Kaiming/He for LeakyReLU)
+            pass  # Already initialized by default
+        else:
+            raise ValueError(f"Unknown init_mode: {self.init_mode}. Must be 'near_zero' or 'random'")
 
     def interpolate_barycentric(self, attrs, faces, A, B):
         """

@@ -33,6 +33,25 @@ except ImportError:
         exit()
         return torch.tensor(0.0, device=x.device), torch.tensor(0.0, device=x.device)
 
+# 尝试导入 SSIM (pytorch-msssim)
+try:
+    from pytorch_msssim import ssim
+    HAS_SSIM = True
+except ImportError:
+    HAS_SSIM = False
+    print("[Warn] pytorch-msssim not found. SSIM loss will be disabled.")
+    def ssim(*args, **kwargs):
+        return torch.tensor(0.0, device=args[0].device if args else 'cuda')
+
+# 尝试导入 LPIPS
+try:
+    import lpips
+    HAS_LPIPS = True
+except ImportError:
+    HAS_LPIPS = False
+    print("[Warn] lpips not found. LPIPS loss will be disabled.")
+    lpips = None
+
 
 def load_config(config_path):
     with open(config_path, 'r') as f:
@@ -134,13 +153,15 @@ def train(config, args):
     dataset = ScanToMeshDataset(
         data_root=config['data']['processed_dir'], 
         split='train',
+        point_num=config['data']['point_num'],
         base_faces_min=config['data']['base_mesh_faces_min'],
         base_faces_max=config['data']['base_mesh_faces_max'],
         backend=config['data'].get('simplification_backend', 'open3d'),
         preprocessed_base_mesh_dir=config['data'].get('preprocessed_base_mesh_dir', None),
         use_preprocess_base_mesh=config['data'].get('use_preprocess_base_mesh', False),
         preload_ram=config['data'].get('preload_ram', False), # Controlled by config
-        lmdb_path=config['data'].get('lmdb_path', None)
+        lmdb_path=config['data'].get('lmdb_path', None),
+        use_scan_normal=config['model'].get('use_scan_normal', False)
     )
     
     dataloader = DataLoader(
@@ -167,6 +188,16 @@ def train(config, args):
         cameras_per_batch=config['render']['views_per_sample'],
         dist_multiplier=config['render'].get('dist_multiplier', 1.0)
     )
+    
+    # Setup LPIPS loss model if available
+    lpips_model = None
+    if HAS_LPIPS:
+        lpips_model = lpips.LPIPS(net='vgg').to(accelerator.device)
+        lpips_model.eval()
+        for param in lpips_model.parameters():
+            param.requires_grad = False
+    else:
+        assert("no lpips model found")
 
     # 5. Optimizer
     optimizer = optim.Adam(
@@ -231,6 +262,7 @@ def train(config, args):
             # in a custom collate, we ensure they are on the right device.
             
             scan_points = batch['scan_points'].to(accelerator.device) # (B, P, 3)
+            scan_normals = batch['scan_normals'].to(accelerator.device) if 'scan_normals' in batch else None
             
             base_verts_list = [v.to(accelerator.device) for v in batch['base_verts']]
             base_faces_list = [f.to(accelerator.device) for f in batch['base_faces']]
@@ -264,9 +296,16 @@ def train(config, args):
                 b_faces = base_faces_list[b].unsqueeze(0).contiguous() # (1, F, 3)
                 b_normals = base_normals_list[b].unsqueeze(0).contiguous()
                 b_scan = scan_points[b].unsqueeze(0).contiguous() # (1, P, 3)
+                b_scan_normals = scan_normals[b].unsqueeze(0).contiguous() if scan_normals is not None else None
+                pred_img = None
+                gt_img = None
+                f_faces_expanded = None
+                loss = None
                 
                 # Forward
-                f_verts, f_faces, disp, trans_feat, vertex_features = model(b_verts, b_faces, b_normals, b_scan)
+                f_verts, f_faces, disp, trans_feat, vertex_features = model(
+                    b_verts, b_faces, b_normals, b_scan, scan_normals=b_scan_normals
+                )
                 
                 # GT
                 g_verts = gt_verts_list[b].unsqueeze(0)
@@ -295,6 +334,11 @@ def train(config, args):
                         step, b, tag=tag
                     )
                     if not is_valid:
+                        # Release tensors before skipping this sample
+                        del f_verts, f_faces, disp, trans_feat, vertex_features
+                        del b_verts, b_faces, b_normals, b_scan, g_verts, g_faces
+                        if b_scan_normals is not None:
+                            del b_scan_normals
                         continue # Skip loss calculation for broken mesh
 
                 # Loss for this item
@@ -310,20 +354,90 @@ def train(config, args):
                     # chamfer_distance returns (loss, loss_normals) or (dist1, dist2)
                     # For pytorch3d, it returns (dist1, dist2) which are squared distances
                     # We need to mean them
-                    # print(f_verts.shape, b_scan.shape)
-                    # exit()
-                    loss_chamfer, _ = chamfer_distance(f_verts, b_scan)
-                    # Also compute rendering for logging/debugging but maybe detach to save compute?
-                    # Let's compute it normally so we can see if it correlates, but weight it 0 if needed
+                    chamfer_result = chamfer_distance(f_verts, b_scan)
+                    loss_chamfer = chamfer_result[0]
+                    # Release the second return value if it exists (may hold computation graph)
+                    if len(chamfer_result) > 1:
+                        del chamfer_result[1]
+                    del chamfer_result
                 
                 # 1. Render Loss
                 # Render Pred vs GT
                 # f_faces is (F_fine, 3), need (1, F_fine, 3)
                 f_faces_expanded = f_faces.unsqueeze(0)
                 
+                # Initialize render loss components
+                loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
+                loss_normal_l1 = torch.tensor(0.0, device=accelerator.device)
+                loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
+                loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
+                pred_img = None
+                gt_img = None
+                pred_depth = None
+                gt_depth = None
+                
                 if not use_chamfer or config['loss']['w_render'] > 0:
-                    pred_img, gt_img = renderer(f_verts, f_faces_expanded, g_verts, g_faces)
-                    loss_render = torch.nn.functional.l1_loss(pred_img, gt_img)
+                    pred_img, gt_img, pred_depth, gt_depth = renderer(f_verts, f_faces_expanded, g_verts, g_faces)
+                    
+                    # Get loss weights from config (defaults: depth_l1=10, normal_l1=4, ssim=0.5, lpips=0.5)
+                    w_depth_l1 = config['loss'].get('w_depth_l1', 10.0)
+                    w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
+                    w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
+                    w_normal_lpips = config['loss'].get('w_normal_lpips', 0.5)
+                    
+                    # 1. Depth L1 Loss
+                    if w_depth_l1 > 0 and pred_depth is not None and gt_depth is not None:
+                        # Only compute on valid pixels (mask > 0)
+                        depth_mask = (pred_depth.abs() > 1e-6) & (gt_depth.abs() > 1e-6)
+                        if depth_mask.any():
+                            loss_depth_l1 = torch.nn.functional.l1_loss(
+                                pred_depth[depth_mask], gt_depth[depth_mask]
+                            )
+                    
+                    # 2. Normal L1 Loss
+                    if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
+                        # Mask: valid pixels (non-zero in either pred or gt)
+                        normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
+                                     (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
+                        if normal_mask.any():
+                            # Apply mask and compute L1 loss
+                            pred_masked = pred_img * normal_mask
+                            gt_masked = gt_img * normal_mask
+                            loss_normal_l1 = torch.nn.functional.l1_loss(pred_masked, gt_masked)
+                    
+                    # 3. Normal SSIM Loss (only on normal maps)
+                    if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
+                        # SSIM expects input in [0, 1] range and (B, C, H, W) format
+                        # Normalize from [-1, 1] to [0, 1]
+                        pred_normal_norm = (pred_img + 1.0) * 0.5  # (BK, H, W, 3)
+                        gt_normal_norm = (gt_img + 1.0) * 0.5
+                        
+                        # Permute to (BK, 3, H, W)
+                        pred_normal_norm = pred_normal_norm.permute(0, 3, 1, 2)
+                        gt_normal_norm = gt_normal_norm.permute(0, 3, 1, 2)
+                        
+                        # Compute SSIM (returns similarity, so loss = 1 - ssim)
+                        ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
+                        loss_normal_ssim = 1.0 - ssim_val
+                    
+                    # 4. Normal LPIPS Loss (only on normal maps)
+                    if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
+                        # LPIPS expects input in [-1, 1] range and (B, C, H, W) format
+                        # Our normal maps are already in [-1, 1] range
+                        # Permute to (BK, 3, H, W)
+                        pred_normal_lpips = pred_img.permute(0, 3, 1, 2)
+                        gt_normal_lpips = gt_img.permute(0, 3, 1, 2)
+                        
+                        # Compute LPIPS (no need for no_grad, LPIPS model is frozen)
+                        loss_normal_lpips = lpips_model(pred_normal_lpips, gt_normal_lpips).mean()
+                    
+                    # Combined render loss
+                    loss_render = (
+                        w_depth_l1 * loss_depth_l1 +
+                        w_normal_l1 * loss_normal_l1 +
+                        w_normal_ssim * loss_normal_ssim +
+                        w_normal_lpips * loss_normal_lpips
+                    )
                     
                     # Debug Export Images (Every 10 steps)
                     if should_export and accelerator.is_main_process:
@@ -427,12 +541,23 @@ def train(config, args):
                 loss_mat_batch += loss_mat.item()
                 
                 # Delete large tensors to free memory immediately
-                del f_verts, f_faces, disp, trans_feat, vertex_features, b_verts, b_faces, b_normals, b_scan
-                if 'pred_img' in locals(): del pred_img
-                if 'gt_img' in locals(): del gt_img
-                if 'loss_render' in locals(): del loss_render
-                if 'loss_chamfer' in locals(): del loss_chamfer
-                del loss
+                del f_verts, f_faces, disp, trans_feat, vertex_features
+                del b_verts, b_faces, b_normals, b_scan
+                del g_verts, g_faces
+                if b_scan_normals is not None:
+                    del b_scan_normals
+                if pred_img is not None:
+                    del pred_img
+                if gt_img is not None:
+                    del gt_img
+                if pred_depth is not None:
+                    del pred_depth
+                if gt_depth is not None:
+                    del gt_depth
+                if f_faces_expanded is not None:
+                    del f_faces_expanded
+                del loss_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss
+                del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
             
             if torch.cuda.is_available(): torch.cuda.synchronize()
             t_forward_backward = time.time()
@@ -445,27 +570,37 @@ def train(config, args):
                 # print(f"Step {step} | Data: {t_data_avail - t_end:.4f}s | Device: {t_to_device - t_data_avail:.4f}s | Fwd+Bwd: {t_forward_backward - t_to_device:.4f}s | Step: {t_step_end - t_forward_backward:.4f}s")
                 pass
 
+            # Save batch_len before releasing batch tensors (needed for logging)
+            batch_len = len(base_verts_list)
+            
             step += 1
             
             # Log
             if step % config['train']['log_interval'] == 0:
                 accelerator.log({
                     "loss/total": total_loss_batch,
-                    "loss/render": loss_render_batch / len(base_verts_list),
-                    "loss/chamfer": loss_chamfer_batch / len(base_verts_list),
-                    "loss/laplacian": loss_lap_batch / len(base_verts_list),
-                    "loss/disp": loss_disp_batch / len(base_verts_list),
-                    "loss/mat": loss_mat_batch / len(base_verts_list),
+                    "loss/render": loss_render_batch / batch_len,
+                    "loss/chamfer": loss_chamfer_batch / batch_len,
+                    "loss/laplacian": loss_lap_batch / batch_len,
+                    "loss/disp": loss_disp_batch / batch_len,
+                    "loss/mat": loss_mat_batch / batch_len,
                     "lr": optimizer.param_groups[0]['lr'],
                     "epoch": epoch
                 }, step=step)
                 
             pbar.set_postfix({
                 'loss': f"{total_loss_batch:.4f}",
-                'cham': f"{loss_chamfer_batch / len(base_verts_list):.4f}",
-                'rend': f"{loss_render_batch / len(base_verts_list):.4f}",
-                'mat': f"{loss_mat_batch / len(base_verts_list):.4f}"
+                'cham': f"{loss_chamfer_batch / batch_len:.4f}",
+                'rend': f"{loss_render_batch / batch_len:.4f}",
+                'mat': f"{loss_mat_batch / batch_len:.4f}"
             })
+            
+            # Release batch-level tensors after logging
+            del scan_points
+            if scan_normals is not None:
+                del scan_normals
+            del base_verts_list, base_faces_list, base_normals_list, gt_verts_list, gt_faces_list
+            torch.cuda.empty_cache()
 
             t_end = time.time()
             

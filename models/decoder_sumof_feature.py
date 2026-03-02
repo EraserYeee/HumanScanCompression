@@ -47,12 +47,13 @@ class SumOfFeatureDecoder(nn.Module):
         predict_offset: If True, predict 3D offset (xyz)
         posenc_mode: 0=No PE, 1=PE(LocalPos), 2=PE(LocalPos) + PE(Normal)
     """
-    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False, posenc_mode=0):
+    def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False, posenc_mode=0, init_mode='near_zero'):
         super().__init__()
         self.fflevels = levels
         self.rate = rate
         self.predict_offset = predict_offset
         self.posenc_mode = posenc_mode
+        self.init_mode = init_mode
         self.subdivision = BarycentricSubdivision()
         
         # --- MLP F (Feature Mapper) ---
@@ -95,9 +96,15 @@ class SumOfFeatureDecoder(nn.Module):
             nn.Linear(hidden_dim, out_dim)
         )
 
-        # Initialize the last layer to output near-zero values
-        nn.init.uniform_(self.mlp_predictor[-1].weight, -1e-5, 1e-5)
-        nn.init.constant_(self.mlp_predictor[-1].bias, 0)
+        # Initialize the last layer based on init_mode
+        if self.init_mode == 'near_zero':
+            nn.init.uniform_(self.mlp_predictor[-1].weight, -1e-5, 1e-5)
+            nn.init.constant_(self.mlp_predictor[-1].bias, 0)
+        elif self.init_mode == 'random':
+            # Use PyTorch default initialization (Kaiming/He for LeakyReLU)
+            pass  # Already initialized by default
+        else:
+            raise ValueError(f"Unknown init_mode: {self.init_mode}. Must be 'near_zero' or 'random'")
 
     def interpolate_barycentric(self, attrs, faces, A, B):
         """
