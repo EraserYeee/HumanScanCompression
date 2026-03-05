@@ -5,7 +5,7 @@ data:
   data_root: /home/ruisi/mesh_compression/data/official
   lmdb_path: /mnt/lab/data/yeruisi/data/compression/train_data.lmdb
   num_workers: 2
-  point_num: 1280000
+  point_num: 128000
   preload_ram: false
   preprocessed_base_mesh_dir: /mnt/lab/data/yeruisi/data/compression/base_mesh_preload
   processed_dir: /mnt/lab/data/yeruisi/data/compression/dataset_preload
@@ -32,19 +32,19 @@ model:
   feature_dim: 512
   posenc_mode: 2
   predict_offset: false
-  subdivision_levels: 8
-  subdivision_rate: 12
+  subdivision_levels: 4
+  subdivision_rate: 4
   use_feature_transform: false
   use_scan_normal: true
   init_mode: random  # 'near_zero' or 'random' initialization
 render:
-  dist_multiplier: 0.5
+  dist_multiplier: 1.0
   image_size: 512
   use_mixed_views: false
-  views_per_sample: 3
+  views_per_sample: 5
 seed: 42
 train:
-  epochs: 500
+  epochs: 100
   log_interval: 10
   lr: 5.0e-05
   save_interval: 3

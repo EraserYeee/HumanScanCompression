@@ -1,4 +1,5 @@
 import os
+import glob
 import torch
 import json
 import trimesh
@@ -27,7 +28,8 @@ class ScanToMeshDataset(Dataset):
                  base_faces_min=2000, base_faces_max=6000, 
                  backend='open3d', debug_export=False,
                  preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False, 
-                 preload_ram=False, lmdb_path=None, use_scan_normal=False):
+                 preload_ram=False, lmdb_path=None, use_scan_normal=False,
+                 dataset_type='human'):
         """
         Args:
             data_root: 预处理数据目录
@@ -39,9 +41,11 @@ class ScanToMeshDataset(Dataset):
             use_preprocess_base_mesh: 是否使用预处理的 Base Mesh
             preload_ram: 是否将所有数据预加载到内存中 (解决 IO 瓶颈)
             lmdb_path: 预打包的 LMDB 数据库路径 (推荐使用)
+            dataset_type: 'human' (默认) 或 'thingi10k'
         """
         self.data_root = data_root
         self.split = split
+        self.dataset_type = dataset_type
         self.point_num = point_num
         self.base_faces_range = (base_faces_min, base_faces_max)
         self.backend = backend
@@ -81,10 +85,19 @@ class ScanToMeshDataset(Dataset):
         
         json_path = os.path.join(data_root, f"{split}.json")
         if not os.path.exists(json_path):
-            raise FileNotFoundError(f"Index file not found: {json_path}")
-            
-        with open(json_path, 'r') as f:
-            self.file_list = json.load(f)
+            if self.dataset_type == 'thingi10k':
+                # Thingi10k: 如果没有索引文件，自动扫描目录中的 .pt 文件生成列表
+                print(f"[Dataset] {json_path} 不存在，自动扫描 {data_root} 中的 .pt 文件...")
+                pt_files = sorted(glob.glob(os.path.join(data_root, "*.pt")))
+                if len(pt_files) == 0:
+                    raise FileNotFoundError(f"No .pt files found in {data_root}")
+                self.file_list = [{'pt_path': os.path.basename(f)} for f in pt_files]
+                print(f"[Dataset] 自动扫描到 {len(self.file_list)} 个 .pt 文件")
+            else:
+                raise FileNotFoundError(f"Index file not found: {json_path}")
+        else:
+            with open(json_path, 'r') as f:
+                self.file_list = json.load(f)
             
         # Build a mapping from GT pt filename to list of base meshes
         if self.use_preprocess_base_mesh:
@@ -98,7 +111,7 @@ class ScanToMeshDataset(Dataset):
                     self.gt_to_base[gt_basename] = []
                 self.gt_to_base[gt_basename].append(entry)
             
-        print(f"[Dataset] Loaded {len(self.file_list)} samples for {split} | Backend: {self.backend} | Preprocessed Base: {self.use_preprocess_base_mesh}")
+        print(f"[Dataset] Loaded {len(self.file_list)} samples for {split} | Type: {self.dataset_type} | Backend: {self.backend} | Preprocessed Base: {self.use_preprocess_base_mesh}")
 
         # --- LMDB Setup ---
         if self.lmdb_path and os.path.exists(self.lmdb_path):

@@ -1,6 +1,6 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import yaml
 import time
 import torch
@@ -150,6 +150,8 @@ def train(config, args):
     if accelerator.is_main_process:
         print(f"Loading dataset from {config['data']['processed_dir']}...")
         
+    dataset_type = config['data'].get('dataset_type', 'human')
+    
     dataset = ScanToMeshDataset(
         data_root=config['data']['processed_dir'], 
         split='train',
@@ -161,7 +163,8 @@ def train(config, args):
         use_preprocess_base_mesh=config['data'].get('use_preprocess_base_mesh', False),
         preload_ram=config['data'].get('preload_ram', False), # Controlled by config
         lmdb_path=config['data'].get('lmdb_path', None),
-        use_scan_normal=config['model'].get('use_scan_normal', False)
+        use_scan_normal=config['model'].get('use_scan_normal', False),
+        dataset_type=dataset_type
     )
     
     dataloader = DataLoader(
