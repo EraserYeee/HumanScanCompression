@@ -2,7 +2,7 @@ data:
   dataset_type: thingi10k  # 'human' (default) or 'thingi10k'
   base_mesh_faces_max: 3000
   base_mesh_faces_min: 1000
-  batch_size: 1
+  batch_size: 4
   data_root: /mnt/lab/data/yeruisi/data/compression/thingi10k
   lmdb_path: null
   num_workers: 2
@@ -39,7 +39,7 @@ model:
   use_scan_normal: true
   init_mode: random  # 'near_zero' or 'random' initialization
 render:
-  dist_multiplier: 0.5
+  dist_multiplier: 1.2
   image_size: 512
   use_mixed_views: false
   views_per_sample: 3

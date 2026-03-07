@@ -1,6 +1,6 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
 import yaml
 import time
 import torch
@@ -285,6 +285,7 @@ def train(config, args):
             loss_lap_batch = 0
             loss_disp_batch = 0
             loss_mat_batch = 0 # Matrix regularization loss
+            loss_kl_batch = 0  # VAE KL divergence loss
             
             # Iterate over batch (Gradient Accumulation logic effectively)
             for b in range(len(base_verts_list)):
@@ -306,7 +307,7 @@ def train(config, args):
                 loss = None
                 
                 # Forward
-                f_verts, f_faces, disp, trans_feat, vertex_features = model(
+                f_verts, f_faces, disp, trans_feat, vertex_features, model_kl_loss = model(
                     b_verts, b_faces, b_normals, b_scan, scan_normals=b_scan_normals
                 )
                 
@@ -339,6 +340,8 @@ def train(config, args):
                     if not is_valid:
                         # Release tensors before skipping this sample
                         del f_verts, f_faces, disp, trans_feat, vertex_features
+                        if model_kl_loss is not None:
+                            del model_kl_loss
                         del b_verts, b_faces, b_normals, b_scan, g_verts, g_faces
                         if b_scan_normals is not None:
                             del b_scan_normals
@@ -464,6 +467,17 @@ def train(config, args):
                 # if trans_feat is not None:
                 #     loss_mat = feature_transform_regularizer(trans_feat)
                 
+                # 5. VAE KL Divergence Loss
+                loss_kl = torch.tensor(0.0, device=accelerator.device)
+                if model_kl_loss is not None:
+                    vae_beta = config['loss'].get('vae_beta', 0.001)
+                    vae_warmup_epochs = config['loss'].get('vae_warmup_epochs', 50)
+                    if epoch < vae_warmup_epochs:
+                        beta = vae_beta * (epoch / max(vae_warmup_epochs, 1))
+                    else:
+                        beta = vae_beta
+                    loss_kl = beta * model_kl_loss
+                
                 # Weighted Sum
                 # w_mat: usually small, e.g. 0.001
                 w_mat = config['loss'].get('w_mat', 0.001)
@@ -485,7 +499,8 @@ def train(config, args):
                     w_chamfer * loss_chamfer +
                     config['loss']['w_laplacian'] * loss_lap +
                     config['loss']['w_disp'] * loss_disp + 
-                    w_mat * loss_mat
+                    w_mat * loss_mat +
+                    loss_kl
                 )
                 
                 # Accumulate (average later)
@@ -542,9 +557,12 @@ def train(config, args):
                 loss_lap_batch += loss_lap.item()
                 loss_disp_batch += loss_disp.item()
                 loss_mat_batch += loss_mat.item()
+                loss_kl_batch += loss_kl.item()
                 
                 # Delete large tensors to free memory immediately
                 del f_verts, f_faces, disp, trans_feat, vertex_features
+                if model_kl_loss is not None:
+                    del model_kl_loss
                 del b_verts, b_faces, b_normals, b_scan
                 del g_verts, g_faces
                 if b_scan_normals is not None:
@@ -559,7 +577,7 @@ def train(config, args):
                     del gt_depth
                 if f_faces_expanded is not None:
                     del f_faces_expanded
-                del loss_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss
+                del loss_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl, loss
                 del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
             
             if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -587,6 +605,7 @@ def train(config, args):
                     "loss/laplacian": loss_lap_batch / batch_len,
                     "loss/disp": loss_disp_batch / batch_len,
                     "loss/mat": loss_mat_batch / batch_len,
+                    "loss/kl": loss_kl_batch / batch_len,
                     "lr": optimizer.param_groups[0]['lr'],
                     "epoch": epoch
                 }, step=step)
@@ -595,7 +614,8 @@ def train(config, args):
                 'loss': f"{total_loss_batch:.4f}",
                 'cham': f"{loss_chamfer_batch / batch_len:.4f}",
                 'rend': f"{loss_render_batch / batch_len:.4f}",
-                'mat': f"{loss_mat_batch / batch_len:.4f}"
+                'mat': f"{loss_mat_batch / batch_len:.4f}",
+                'kl': f"{loss_kl_batch / batch_len:.6f}"
             })
             
             # Release batch-level tensors after logging

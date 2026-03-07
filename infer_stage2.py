@@ -299,7 +299,7 @@ def main():
         b_s = torch.from_numpy(scan_points).float().unsqueeze(0).to(device).contiguous()
 
         with torch.no_grad():
-            fv, ff, _, _, _ = model(b_v, b_f, b_n, b_s)
+            fv, ff, _, _, _, _ = model(b_v, b_f, b_n, b_s)
             
         trimesh.Trimesh(vertices=fv[0].cpu().numpy(), faces=ff.cpu().numpy(), process=False).export(os.path.join(fine_mesh_out_dir, f"{name}_fine.obj"))
 

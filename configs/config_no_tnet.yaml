@@ -5,7 +5,7 @@ data:
   data_root: /home/ruisi/mesh_compression/data/official
   lmdb_path: /mnt/lab/data/yeruisi/data/compression/train_data.lmdb
   num_workers: 2
-  point_num: 1280000
+  point_num: 819200
   preload_ram: false
   preprocessed_base_mesh_dir: /mnt/lab/data/yeruisi/data/compression/base_mesh_preload
   processed_dir: /mnt/lab/data/yeruisi/data/compression/dataset_preload
@@ -25,6 +25,9 @@ loss:
   w_normal_l1: 4.0      # L1 loss for normal maps
   w_normal_ssim: 0.5    # SSIM loss for normal maps only
   w_normal_lpips: 0.5   # LPIPS loss for normal maps only
+  # VAE loss (only active when model.use_vae=true)
+  vae_beta: 0.001         # KL divergence weight
+  vae_warmup_epochs: 50   # linearly ramp beta from 0 to vae_beta over this many epochs
 model:
   dec_hidden_dim: 256
   decoder_type: sum_of_feature
@@ -37,6 +40,13 @@ model:
   use_feature_transform: false
   use_scan_normal: true
   init_mode: random  # 'near_zero' or 'random' initialization
+  # Encoder type: 'standard' (original MaxPool PointNet) or 'attentive' (multi-head attention pooling)
+  encoder_type: attentive
+  num_attention_heads: 4       # number of attention heads (only for 'attentive')
+  use_max_pool_residual: true  # combine attention pooling with max pooling (only for 'attentive')
+  # VAE bottleneck (decoupled, can be toggled independently)
+  use_vae: false
+  vae_latent_dim: 128          # latent dimension when VAE is enabled
 render:
   dist_multiplier: 0.5
   image_size: 512
