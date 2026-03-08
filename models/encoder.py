@@ -172,7 +172,10 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         with torch.no_grad():
             # Scale down the default initialization
             self.score_linear.weight.data *= score_init_scale
-            self.score_linear.bias.data *= score_init_scale
+            # Initialize bias to small positive values to avoid all-negative logits
+            # This helps create a more balanced initial attention distribution
+            self.score_linear.bias.data.zero_()
+            self.score_linear.bias.data += 0.1 * score_init_scale  # Small positive bias
         
         # Projection for combining Attention + Max pooling
         if use_max_pool_residual:
