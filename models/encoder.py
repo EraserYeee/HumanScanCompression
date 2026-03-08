@@ -165,6 +165,12 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         # Value projection: per-point -> output_dim (split into H heads internally)
         self.value_linear = nn.Linear(output_dim, output_dim)
         
+        # === Improved Initialization for Score Network (方案2) ===
+        # Initialize score_linear with small weights to start with near-uniform attention
+        # This prevents initial saturation and allows gradual learning of attention patterns
+        nn.init.normal_(self.score_linear.weight, mean=0.0, std=0.01)  # Very small std
+        nn.init.constant_(self.score_linear.bias, 0.0)  # Zero bias for uniform initial distribution
+        
         # Projection for combining Attention + Max pooling
         if use_max_pool_residual:
             self.projection = nn.Sequential(
