@@ -40,7 +40,9 @@ class Stage2Pipeline(nn.Module):
                 hidden_dim=config.get('enc_hidden_dim', 64),
                 output_dim=config.get('feature_dim', 128),
                 num_attention_heads=config.get('num_attention_heads', 4),
-                use_max_pool_residual=config.get('use_max_pool_residual', True)
+                use_max_pool_residual=config.get('use_max_pool_residual', True),
+                attention_temperature=config.get('attention_temperature', 2.0),
+                score_init_scale=config.get('score_init_scale', 0.1)
             )
         else:
             self.encoder = LocalFeatureEncoder(

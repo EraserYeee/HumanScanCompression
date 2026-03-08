@@ -134,11 +134,13 @@ class AttentiveLocalFeatureEncoder(nn.Module):
     可选: 同时保留 Max Pooling 作为互补信号 (use_max_pool_residual=True)。
     """
     def __init__(self, input_dim=3, hidden_dim=64, output_dim=128, 
-                 num_attention_heads=4, use_max_pool_residual=True):
+                 num_attention_heads=4, use_max_pool_residual=True, 
+                 attention_temperature=1.0, score_init_scale=0.1):
         super().__init__()
         self.output_dim = output_dim
         self.num_heads = num_attention_heads
         self.use_max_pool_residual = use_max_pool_residual
+        self.attention_temperature = attention_temperature
         assert output_dim % num_attention_heads == 0, \
             f"output_dim ({output_dim}) must be divisible by num_attention_heads ({num_attention_heads})"
         
@@ -165,11 +167,12 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         # Value projection: per-point -> output_dim (split into H heads internally)
         self.value_linear = nn.Linear(output_dim, output_dim)
         
-        # === Improved Initialization for Score Network (方案2) ===
-        # Initialize score_linear with small weights to start with near-uniform attention
-        # This prevents initial saturation and allows gradual learning of attention patterns
-        nn.init.normal_(self.score_linear.weight, mean=0.0, std=0.01)  # Very small std
-        nn.init.constant_(self.score_linear.bias, 0.0)  # Zero bias for uniform initial distribution
+        # Initialize score_linear with smaller weights to prevent extreme logits
+        # This helps avoid softmax saturation in early training
+        with torch.no_grad():
+            # Scale down the default initialization
+            self.score_linear.weight.data *= score_init_scale
+            self.score_linear.bias.data *= score_init_scale
         
         # Projection for combining Attention + Max pooling
         if use_max_pool_residual:
@@ -213,8 +216,12 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         # 1. Compute attention logits
         scores = self.score_linear(point_feats)  # (B*P, H)
         
-        # 2. Per-cluster softmax (scatter_softmax handles variable-size groups)
-        alpha = scatter_softmax(scores, global_cluster_idx, dim=0)  # (B*P, H)
+        # 2. Apply temperature scaling to reduce softmax saturation
+        # T > 1 makes distribution smoother, T < 1 makes it sharper
+        scores_scaled = scores / self.attention_temperature
+        
+        # 3. Per-cluster softmax (scatter_softmax handles variable-size groups)
+        alpha = scatter_softmax(scores_scaled, global_cluster_idx, dim=0)  # (B*P, H)
         
         # 3. Value projection + multi-head reshape
         values = self.value_linear(point_feats)  # (B*P, output_dim)
@@ -256,11 +263,17 @@ class AttentiveLocalFeatureEncoder(nn.Module):
                     'min': point_feats.min().item(),
                     'max': point_feats.max().item(),
                 },
-                'scores': {  # Before softmax (logits)
+                'scores': {  # Before softmax (logits, original scale)
                     'mean': scores.mean().item(),
                     'std': scores.std().item(),
                     'min': scores.min().item(),
                     'max': scores.max().item(),
+                },
+                'scores_scaled': {  # After temperature scaling (before softmax)
+                    'mean': scores_scaled.mean().item(),
+                    'std': scores_scaled.std().item(),
+                    'min': scores_scaled.min().item(),
+                    'max': scores_scaled.max().item(),
                 },
                 'attention_scores': {  # After softmax (alpha)
                     'mean': alpha.mean().item(),

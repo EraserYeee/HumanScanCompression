@@ -691,8 +691,12 @@ def train(config, args):
                                   f"min={pf.get('min', 0):.6f}, max={pf.get('max', 0):.6f}")
                         if 'scores' in avg_diag:
                             sc = avg_diag['scores']
-                            print(f"  Scores (logits): mean={sc.get('mean', 0):.6f}, std={sc.get('std', 0):.6f}, "
+                            print(f"  Scores (logits, raw): mean={sc.get('mean', 0):.6f}, std={sc.get('std', 0):.6f}, "
                                   f"min={sc.get('min', 0):.6f}, max={sc.get('max', 0):.6f}")
+                        if 'scores_scaled' in avg_diag:
+                            scs = avg_diag['scores_scaled']
+                            print(f"  Scores (logits, scaled): mean={scs.get('mean', 0):.6f}, std={scs.get('std', 0):.6f}, "
+                                  f"min={scs.get('min', 0):.6f}, max={scs.get('max', 0):.6f}")
                         if 'attention_scores' in avg_diag:
                             att = avg_diag['attention_scores']
                             print(f"  Attention (alpha): mean={att.get('mean', 0):.6f}, std={att.get('std', 0):.6f}, "

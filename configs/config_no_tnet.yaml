@@ -44,6 +44,8 @@ model:
   encoder_type: attentive
   num_attention_heads: 4       # number of attention heads (only for 'attentive')
   use_max_pool_residual: true  # combine attention pooling with max pooling (only for 'attentive')
+  attention_temperature: 2.0   # temperature scaling for attention softmax (T>1: smoother, T<1: sharper)
+  score_init_scale: 0.1        # scale factor for score_linear initialization (smaller = more uniform initial attention)
   # VAE bottleneck (decoupled, can be toggled independently)
   use_vae: false
   vae_latent_dim: 128          # latent dimension when VAE is enabled
