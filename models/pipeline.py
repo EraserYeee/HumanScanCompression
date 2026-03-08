@@ -96,7 +96,7 @@ class Stage2Pipeline(nn.Module):
                     **common_kwargs
             )
 
-    def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None):
+    def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None, return_attention=False):
         """
         Args:
             base_verts: (B, V, 3)
@@ -104,6 +104,7 @@ class Stage2Pipeline(nn.Module):
             base_normals: (B, V, 3)
             scan_points: (B, P, 3)
             scan_normals: (B, P, 3) or None
+            return_attention: bool, 是否返回注意力分数（仅当 encoder_type='attentive' 时有效）
 
         Returns:
             fine_verts: (B, V_fine, 3)
@@ -112,6 +113,8 @@ class Stage2Pipeline(nn.Module):
             trans_feat: (B*V, K, K) or None (for regularization loss)
             vertex_features: (B, V, D) (Debug: check variance)
             kl_loss: scalar or None (VAE KL divergence loss)
+            attention_scores: (B*P, H) or None, 注意力分数（仅当 return_attention=True 且 encoder_type='attentive'）
+            global_cluster_idx: (B*P,) or None, 全局 cluster 索引（仅当 return_attention=True 且 encoder_type='attentive'）
         """
         # 1. Grouping
         local_points, cluster_idx = self.grouper(base_verts, base_normals, scan_points)
@@ -122,7 +125,16 @@ class Stage2Pipeline(nn.Module):
         encoder_input = local_points
         if self.use_scan_normal and scan_normals is not None:
             encoder_input = torch.cat([encoder_input, scan_normals], dim=-1)
-        vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
+        
+        # Check if encoder supports attention return
+        is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
+        if return_attention and is_attentive:
+            vertex_features, trans_feat, attention_scores, global_cluster_idx = self.encoder(
+                encoder_input, cluster_idx, num_verts=V, return_attention=True
+            )
+        else:
+            vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
+            attention_scores, global_cluster_idx = None, None
 
         # 2.5 VAE Bottleneck (optional)
         kl_loss = None
@@ -132,4 +144,7 @@ class Stage2Pipeline(nn.Module):
         # 3. Decoding
         fine_verts, fine_faces, displacements = self.decoder(base_verts, base_faces, vertex_features, base_normals)
 
-        return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss
+        if return_attention and is_attentive:
+            return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, attention_scores, global_cluster_idx
+        else:
+            return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss

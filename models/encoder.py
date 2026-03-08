@@ -172,16 +172,19 @@ class AttentiveLocalFeatureEncoder(nn.Module):
                 nn.ReLU()
             )
 
-    def forward(self, local_points: torch.Tensor, cluster_idx: torch.Tensor, num_verts: int):
+    def forward(self, local_points: torch.Tensor, cluster_idx: torch.Tensor, num_verts: int, return_attention=False):
         """
         Args:
             local_points: (B, P, D) 局部坐标点 (可能含法线拼接, D=3 or 6)
             cluster_idx: (B, P) 点归属索引, 值域 [0, V-1]
             num_verts: int 最大顶点数 V
+            return_attention: bool, 是否返回注意力分数用于可视化
 
         Returns:
             vertex_features: (B, V, output_dim) 每个 Base Mesh 顶点的特征
             trans_feat: None (保持 API 兼容)
+            attention_scores: (B*P, H) or None, 每个点在每个头的注意力权重
+            global_cluster_idx: (B*P,) or None, 全局 cluster 索引
         """
         B, P, D = local_points.shape
         flat_points = local_points.view(-1, D)
@@ -233,7 +236,10 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         # Reshape to batch
         vertex_features = aggregated_feats.view(B, num_verts, self.output_dim)
         
-        return vertex_features, None  # None for trans_feat (API compatibility)
+        if return_attention:
+            return vertex_features, None, alpha, global_cluster_idx
+        else:
+            return vertex_features, None  # None for trans_feat (API compatibility)
 
 
 class VAEHead(nn.Module):
