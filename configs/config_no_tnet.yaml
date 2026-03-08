@@ -53,6 +53,8 @@ render:
   use_mixed_views: false
   views_per_sample: 3
 seed: 42
+# Enable attention mechanism diagnostics (only effective when encoder_type='attentive')
+enable_attention_diagnostics: true  # Set to false to disable diagnostics
 train:
   epochs: 500
   log_interval: 10

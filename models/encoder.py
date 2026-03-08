@@ -172,19 +172,22 @@ class AttentiveLocalFeatureEncoder(nn.Module):
                 nn.ReLU()
             )
 
-    def forward(self, local_points: torch.Tensor, cluster_idx: torch.Tensor, num_verts: int, return_attention=False):
+    def forward(self, local_points: torch.Tensor, cluster_idx: torch.Tensor, num_verts: int, 
+                return_attention=False, return_diagnostics=False):
         """
         Args:
             local_points: (B, P, D) 局部坐标点 (可能含法线拼接, D=3 or 6)
             cluster_idx: (B, P) 点归属索引, 值域 [0, V-1]
             num_verts: int 最大顶点数 V
             return_attention: bool, 是否返回注意力分数用于可视化
+            return_diagnostics: bool, 是否返回诊断信息（用于调试注意力机制）
 
         Returns:
             vertex_features: (B, V, output_dim) 每个 Base Mesh 顶点的特征
             trans_feat: None (保持 API 兼容)
             attention_scores: (B*P, H) or None, 每个点在每个头的注意力权重
             global_cluster_idx: (B*P,) or None, 全局 cluster 索引
+            diagnostics: dict or None, 诊断信息
         """
         B, P, D = local_points.shape
         flat_points = local_points.view(-1, D)
@@ -236,10 +239,53 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         # Reshape to batch
         vertex_features = aggregated_feats.view(B, num_verts, self.output_dim)
         
+        # Collect diagnostics if requested
+        diagnostics = None
+        if return_diagnostics:
+            # Compute statistics for each head
+            diagnostics = {
+                'point_feats': {
+                    'mean': point_feats.mean().item(),
+                    'std': point_feats.std().item(),
+                    'min': point_feats.min().item(),
+                    'max': point_feats.max().item(),
+                },
+                'scores': {  # Before softmax (logits)
+                    'mean': scores.mean().item(),
+                    'std': scores.std().item(),
+                    'min': scores.min().item(),
+                    'max': scores.max().item(),
+                },
+                'attention_scores': {  # After softmax (alpha)
+                    'mean': alpha.mean().item(),
+                    'std': alpha.std().item(),
+                    'min': alpha.min().item(),
+                    'max': alpha.max().item(),
+                },
+                'score_linear_grad_norm': None,  # Will be filled in training loop
+                'num_points': point_feats.shape[0],
+                'num_clusters': total_clusters,
+            }
+            # Per-head statistics for attention scores
+            for h in range(self.num_heads):
+                alpha_h = alpha[:, h]
+                diagnostics[f'head_{h}'] = {
+                    'mean': alpha_h.mean().item(),
+                    'std': alpha_h.std().item(),
+                    'min': alpha_h.min().item(),
+                    'max': alpha_h.max().item(),
+                }
+        
         if return_attention:
-            return vertex_features, None, alpha, global_cluster_idx
+            if return_diagnostics:
+                return vertex_features, None, alpha, global_cluster_idx, diagnostics
+            else:
+                return vertex_features, None, alpha, global_cluster_idx
         else:
-            return vertex_features, None  # None for trans_feat (API compatibility)
+            if return_diagnostics:
+                return vertex_features, None, diagnostics
+            else:
+                return vertex_features, None  # None for trans_feat (API compatibility)
 
 
 class VAEHead(nn.Module):

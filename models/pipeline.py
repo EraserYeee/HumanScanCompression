@@ -96,7 +96,8 @@ class Stage2Pipeline(nn.Module):
                     **common_kwargs
             )
 
-    def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None, return_attention=False):
+    def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None, 
+                return_attention=False, return_diagnostics=False):
         """
         Args:
             base_verts: (B, V, 3)
@@ -105,6 +106,7 @@ class Stage2Pipeline(nn.Module):
             scan_points: (B, P, 3)
             scan_normals: (B, P, 3) or None
             return_attention: bool, 是否返回注意力分数（仅当 encoder_type='attentive' 时有效）
+            return_diagnostics: bool, 是否返回诊断信息（仅当 encoder_type='attentive' 时有效）
 
         Returns:
             fine_verts: (B, V_fine, 3)
@@ -115,6 +117,7 @@ class Stage2Pipeline(nn.Module):
             kl_loss: scalar or None (VAE KL divergence loss)
             attention_scores: (B*P, H) or None, 注意力分数（仅当 return_attention=True 且 encoder_type='attentive'）
             global_cluster_idx: (B*P,) or None, 全局 cluster 索引（仅当 return_attention=True 且 encoder_type='attentive'）
+            diagnostics: dict or None, 诊断信息（仅当 return_diagnostics=True 且 encoder_type='attentive'）
         """
         # 1. Grouping
         local_points, cluster_idx = self.grouper(base_verts, base_normals, scan_points)
@@ -128,10 +131,22 @@ class Stage2Pipeline(nn.Module):
         
         # Check if encoder supports attention return
         is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
+        diagnostics = None
+        
         if return_attention and is_attentive:
-            vertex_features, trans_feat, attention_scores, global_cluster_idx = self.encoder(
-                encoder_input, cluster_idx, num_verts=V, return_attention=True
+            result = self.encoder(
+                encoder_input, cluster_idx, num_verts=V, 
+                return_attention=True, return_diagnostics=return_diagnostics
             )
+            if return_diagnostics:
+                vertex_features, trans_feat, attention_scores, global_cluster_idx, diagnostics = result
+            else:
+                vertex_features, trans_feat, attention_scores, global_cluster_idx = result
+        elif return_diagnostics and is_attentive:
+            vertex_features, trans_feat, diagnostics = self.encoder(
+                encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
+            )
+            attention_scores, global_cluster_idx = None, None
         else:
             vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
             attention_scores, global_cluster_idx = None, None
@@ -145,6 +160,11 @@ class Stage2Pipeline(nn.Module):
         fine_verts, fine_faces, displacements = self.decoder(base_verts, base_faces, vertex_features, base_normals)
 
         if return_attention and is_attentive:
-            return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, attention_scores, global_cluster_idx
+            if return_diagnostics:
+                return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, attention_scores, global_cluster_idx, diagnostics
+            else:
+                return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, attention_scores, global_cluster_idx
+        elif return_diagnostics and is_attentive:
+            return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, diagnostics
         else:
             return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss
