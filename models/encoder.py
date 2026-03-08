@@ -174,8 +174,9 @@ class AttentiveLocalFeatureEncoder(nn.Module):
             self.score_linear.weight.data *= score_init_scale
             # Initialize bias to small positive values to avoid all-negative logits
             # This helps create a more balanced initial attention distribution
+            # Using a larger bias multiplier to push initial logits closer to zero
             self.score_linear.bias.data.zero_()
-            self.score_linear.bias.data += 0.1 * score_init_scale  # Small positive bias
+            self.score_linear.bias.data += 0.3 * score_init_scale  # Positive bias to balance logits
         
         # Projection for combining Attention + Max pooling
         if use_max_pool_residual:
