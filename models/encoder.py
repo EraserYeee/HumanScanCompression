@@ -135,12 +135,14 @@ class AttentiveLocalFeatureEncoder(nn.Module):
     """
     def __init__(self, input_dim=3, hidden_dim=64, output_dim=128, 
                  num_attention_heads=4, use_max_pool_residual=True, 
-                 attention_temperature=1.0, score_init_scale=0.1):
+                 attention_temperature=1.0, score_init_scale=0.1,
+                 score_clip_value=5.0):
         super().__init__()
         self.output_dim = output_dim
         self.num_heads = num_attention_heads
         self.use_max_pool_residual = use_max_pool_residual
         self.attention_temperature = attention_temperature
+        self.score_clip_value = score_clip_value  # Clip logits to prevent extreme values
         assert output_dim % num_attention_heads == 0, \
             f"output_dim ({output_dim}) must be divisible by num_attention_heads ({num_attention_heads})"
         
@@ -220,11 +222,16 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         # 1. Compute attention logits
         scores = self.score_linear(point_feats)  # (B*P, H)
         
-        # 2. Apply temperature scaling to reduce softmax saturation
+        # 2. Clip logits to prevent extreme values (prevents weight explosion)
+        # This helps maintain stable training and prevents softmax saturation
+        if self.score_clip_value > 0:
+            scores = torch.clamp(scores, min=-self.score_clip_value, max=self.score_clip_value)
+        
+        # 3. Apply temperature scaling to reduce softmax saturation
         # T > 1 makes distribution smoother, T < 1 makes it sharper
         scores_scaled = scores / self.attention_temperature
         
-        # 3. Per-cluster softmax (scatter_softmax handles variable-size groups)
+        # 4. Per-cluster softmax (scatter_softmax handles variable-size groups)
         alpha = scatter_softmax(scores_scaled, global_cluster_idx, dim=0)  # (B*P, H)
         
         # 3. Value projection + multi-head reshape

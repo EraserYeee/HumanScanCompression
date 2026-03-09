@@ -42,7 +42,8 @@ class Stage2Pipeline(nn.Module):
                 num_attention_heads=config.get('num_attention_heads', 4),
                 use_max_pool_residual=config.get('use_max_pool_residual', True),
                 attention_temperature=config.get('attention_temperature', 2.0),
-                score_init_scale=config.get('score_init_scale', 0.1)
+                score_init_scale=config.get('score_init_scale', 0.1),
+                score_clip_value=config.get('score_clip_value', 5.0)
             )
         else:
             self.encoder = LocalFeatureEncoder(
