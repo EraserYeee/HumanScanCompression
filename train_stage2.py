@@ -125,7 +125,7 @@ def debug_export_images(pred_img, gt_img, step, batch_idx, tag=""):
 def train(config, args):
     # 1. Setup Accelerator
     accelerator = Accelerator(
-        mixed_precision=config['train'].get('mixed_precision', 'no'),
+        mixed_precision=config['train'].get('mixed_precision', 'bf16'),
         log_with="wandb" if not args.no_wandb else None
     )
     set_seed(42)
@@ -274,10 +274,9 @@ def train(config, args):
             gt_verts_list = [v.to(accelerator.device) for v in batch['gt_verts']]
             gt_faces_list = [f.to(accelerator.device) for f in batch['gt_faces']]
             
-            if torch.cuda.is_available(): torch.cuda.synchronize()
             t_to_device = time.time()
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
             total_loss_batch = 0
             loss_render_batch = 0
@@ -601,11 +600,9 @@ def train(config, args):
                 del loss_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl, loss
                 del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
             
-            if torch.cuda.is_available(): torch.cuda.synchronize()
             t_forward_backward = time.time()
 
             optimizer.step()
-            if torch.cuda.is_available(): torch.cuda.synchronize()
             t_step_end = time.time()
 
             if accelerator.is_main_process:
@@ -731,7 +728,8 @@ def train(config, args):
             if scan_normals is not None:
                 del scan_normals
             del base_verts_list, base_faces_list, base_normals_list, gt_verts_list, gt_faces_list
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available() and (step % 50 == 0):
+                torch.cuda.empty_cache()
 
             t_end = time.time()
             

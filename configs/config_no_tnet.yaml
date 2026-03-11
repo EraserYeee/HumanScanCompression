@@ -12,7 +12,7 @@ data:
   simplification_backend: pyfqmr
   use_preprocess_base_mesh: true
 device: cuda
-experiment_name: stage2_baseline_sumoffeature_mode2_n
+experiment_name: stage2_baseline_sumoffeature_vae_attentiononly
 loss:
   use_chamfer: false
   w_chamfer: 100.0
@@ -27,7 +27,7 @@ loss:
   w_normal_lpips: 0.5   # LPIPS loss for normal maps only
   # VAE loss (only active when model.use_vae=true)
   vae_beta: 0.001         # KL divergence weight
-  vae_warmup_epochs: 50   # linearly ramp beta from 0 to vae_beta over this many epochs
+  vae_warmup_epochs: 0   # linearly ramp beta from 0 to vae_beta over this many epochs
 model:
   dec_hidden_dim: 256
   decoder_type: sum_of_feature
@@ -39,16 +39,17 @@ model:
   subdivision_rate: 12
   use_feature_transform: false
   use_scan_normal: true
-  init_mode: random  # 'near_zero' or 'random' initialization
+  init_mode: near_zero  # 'near_zero' or 'random' initialization
   # Encoder type: 'standard' (original MaxPool PointNet) or 'attentive' (multi-head attention pooling)
   encoder_type: attentive
-  num_attention_heads: 4       # number of attention heads (only for 'attentive')
-  use_max_pool_residual: true  # combine attention pooling with max pooling (only for 'attentive')
-  attention_temperature: 2.0   # temperature scaling for attention softmax (T>1: smoother, T<1: sharper)
-  score_init_scale: 0.1        # scale factor for score_linear initialization (smaller = more uniform initial attention)
+  num_attention_heads: 8       # number of attention heads (only for 'attentive')
+  use_max_pool_residual: false  # combine attention pooling with max pooling (only for 'attentive')
+  attention_temperature: 1.5   # temperature scaling for attention softmax (T>1: smoother, T<1: sharper)
+  score_init_scale: 0.4        # scale factor for score_linear initialization (smaller = more uniform initial attention)
+  score_clip_value: 5.0         # scale factor for score_linear initialization (smaller = more uniform initial attention)
   # VAE bottleneck (decoupled, can be toggled independently)
-  use_vae: false
-  vae_latent_dim: 128          # latent dimension when VAE is enabled
+  use_vae: true
+  vae_latent_dim: 20          # latent dimension when VAE is enabled
 render:
   dist_multiplier: 0.5
   image_size: 512
@@ -60,6 +61,6 @@ enable_attention_diagnostics: true  # Set to false to disable diagnostics
 train:
   epochs: 500
   log_interval: 10
-  lr: 5.0e-05
+  lr: 5.0e-04
   save_interval: 3
   weight_decay: 1.0e-05
