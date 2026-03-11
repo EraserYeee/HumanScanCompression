@@ -254,48 +254,50 @@ def train(config, args):
     
     step = start_epoch * len(dataloader)
     for epoch in range(start_epoch, epochs):
+        oom_count = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", disable=not accelerator.is_local_main_process)
         
         t_end = time.time()
         for batch in pbar:
-            t_data_avail = time.time()
+            try:
+                t_data_avail = time.time()
 
-            # Unpack batch data (List of Tensors)
-            # Accelerate handles the main batch dict move if it can, but for lists of tensors 
-            # in a custom collate, we ensure they are on the right device.
-            
-            scan_points = batch['scan_points'].to(accelerator.device) # (B, P, 3)
-            scan_normals = batch['scan_normals'].to(accelerator.device) if 'scan_normals' in batch else None
-            
-            base_verts_list = [v.to(accelerator.device) for v in batch['base_verts']]
-            base_faces_list = [f.to(accelerator.device) for f in batch['base_faces']]
-            base_normals_list = [n.to(accelerator.device) for n in batch['base_normals']]
-            
-            gt_verts_list = [v.to(accelerator.device) for v in batch['gt_verts']]
-            gt_faces_list = [f.to(accelerator.device) for f in batch['gt_faces']]
-            
-            t_to_device = time.time()
+                # Unpack batch data (List of Tensors)
+                # Accelerate handles the main batch dict move if it can, but for lists of tensors 
+                # in a custom collate, we ensure they are on the right device.
+                
+                scan_points = batch['scan_points'].to(accelerator.device) # (B, P, 3)
+                scan_normals = batch['scan_normals'].to(accelerator.device) if 'scan_normals' in batch else None
+                
+                base_verts_list = [v.to(accelerator.device) for v in batch['base_verts']]
+                base_faces_list = [f.to(accelerator.device) for f in batch['base_faces']]
+                base_normals_list = [n.to(accelerator.device) for n in batch['base_normals']]
+                
+                gt_verts_list = [v.to(accelerator.device) for v in batch['gt_verts']]
+                gt_faces_list = [f.to(accelerator.device) for f in batch['gt_faces']]
+                
+                # t_to_device = time.time()
 
-            optimizer.zero_grad(set_to_none=True)
-            
-            total_loss_batch = 0
-            loss_render_batch = 0
-            loss_chamfer_batch = 0
-            loss_lap_batch = 0
-            loss_disp_batch = 0
-            loss_mat_batch = 0 # Matrix regularization loss
-            loss_kl_batch = 0  # VAE KL divergence loss
-            
-            # Check if we should collect diagnostics (only for attentive encoder)
-            enable_diagnostics = config['model'].get('encoder_type', 'standard') == 'attentive'
-            enable_diagnostics = enable_diagnostics and config.get('enable_attention_diagnostics', False)
-            diagnostics_list = []  # Collect diagnostics from all batch items
-            
-            # Iterate over batch (Gradient Accumulation logic effectively)
-            for b in range(len(base_verts_list)):
-                # Skip if empty mesh
-                if base_faces_list[b].shape[0] == 0:
-                    continue
+                optimizer.zero_grad(set_to_none=True)
+                
+                total_loss_batch = 0
+                loss_render_batch = 0
+                loss_chamfer_batch = 0
+                loss_lap_batch = 0
+                loss_disp_batch = 0
+                loss_mat_batch = 0 # Matrix regularization loss
+                loss_kl_batch = 0  # VAE KL divergence loss
+                
+                # Check if we should collect diagnostics (only for attentive encoder)
+                enable_diagnostics = config['model'].get('encoder_type', 'standard') == 'attentive'
+                enable_diagnostics = enable_diagnostics and config.get('enable_attention_diagnostics', False)
+                diagnostics_list = []  # Collect diagnostics from all batch items
+                
+                # Iterate over batch (Gradient Accumulation logic effectively)
+                for b in range(len(base_verts_list)):
+                    # Skip if empty mesh
+                    if base_faces_list[b].shape[0] == 0:
+                        continue
                     
                 # Single item forward
                 # Unsqueeze inputs to fake batch=1
@@ -600,138 +602,151 @@ def train(config, args):
                 del loss_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl, loss
                 del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
             
-            t_forward_backward = time.time()
+            # t_forward_backward = time.time()
 
-            optimizer.step()
-            t_step_end = time.time()
+                optimizer.step()
+                # t_step_end = time.time()
 
-            if accelerator.is_main_process:
-                # print(f"Step {step} | Data: {t_data_avail - t_end:.4f}s | Device: {t_to_device - t_data_avail:.4f}s | Fwd+Bwd: {t_forward_backward - t_to_device:.4f}s | Step: {t_step_end - t_forward_backward:.4f}s")
-                pass
+                if accelerator.is_main_process:
+                    # print(f"Step {step} | Data: {t_data_avail - t_end:.4f}s | Device: {t_to_device - t_data_avail:.4f}s | Fwd+Bwd: {t_forward_backward - t_to_device:.4f}s | Step: {t_step_end - t_forward_backward:.4f}s")
+                    pass
 
-            # Collect gradient information for diagnostics (after optimizer.step())
-            if enable_diagnostics and len(diagnostics_list) > 0:
-                unwrapped_model = accelerator.unwrap_model(model)
-                if hasattr(unwrapped_model, 'encoder') and hasattr(unwrapped_model.encoder, 'score_linear'):
-                    score_linear = unwrapped_model.encoder.score_linear
-                    if score_linear.weight.grad is not None:
-                        grad_norm = score_linear.weight.grad.norm().item()
-                        weight_norm = score_linear.weight.norm().item()
-                        # Update diagnostics with gradient info
-                        for diag in diagnostics_list:
-                            diag['score_linear_grad_norm'] = grad_norm
-                            diag['score_linear_weight_norm'] = weight_norm
-
-            # Save batch_len before releasing batch tensors (needed for logging)
-            batch_len = len(base_verts_list)
-            
-            step += 1
-            
-            # Log
-            if step % config['train']['log_interval'] == 0:
-                log_dict = {
-                    "loss/total": total_loss_batch,
-                    "loss/render": loss_render_batch / batch_len,
-                    "loss/chamfer": loss_chamfer_batch / batch_len,
-                    "loss/laplacian": loss_lap_batch / batch_len,
-                    "loss/disp": loss_disp_batch / batch_len,
-                    "loss/mat": loss_mat_batch / batch_len,
-                    "loss/kl": loss_kl_batch / batch_len,
-                    "lr": optimizer.param_groups[0]['lr'],
-                    "epoch": epoch
-                }
-                
-                # Add diagnostics if available
+                # Collect gradient information for diagnostics (after optimizer.step())
                 if enable_diagnostics and len(diagnostics_list) > 0:
-                    # Average diagnostics across batch items
-                    avg_diag = {}
-                    for key in diagnostics_list[0].keys():
-                        if isinstance(diagnostics_list[0][key], dict):
-                            # Nested dict (e.g., 'point_feats', 'scores', etc.)
-                            avg_diag[key] = {}
-                            for subkey in diagnostics_list[0][key].keys():
-                                if subkey != 'score_linear_grad_norm':  # This is set after backward
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    if hasattr(unwrapped_model, 'encoder') and hasattr(unwrapped_model.encoder, 'score_linear'):
+                        score_linear = unwrapped_model.encoder.score_linear
+                        if score_linear.weight.grad is not None:
+                            grad_norm = score_linear.weight.grad.norm().item()
+                            weight_norm = score_linear.weight.norm().item()
+                            # Update diagnostics with gradient info
+                            for diag in diagnostics_list:
+                                diag['score_linear_grad_norm'] = grad_norm
+                                diag['score_linear_weight_norm'] = weight_norm
+
+                # Save batch_len before releasing batch tensors (needed for logging)
+                batch_len = len(base_verts_list)
+                
+                step += 1
+                
+                # Log
+                if step % config['train']['log_interval'] == 0:
+                    log_dict = {
+                        "loss/total": total_loss_batch,
+                        "loss/render": loss_render_batch / batch_len,
+                        "loss/chamfer": loss_chamfer_batch / batch_len,
+                        "loss/laplacian": loss_lap_batch / batch_len,
+                        "loss/disp": loss_disp_batch / batch_len,
+                        "loss/mat": loss_mat_batch / batch_len,
+                        "loss/kl": loss_kl_batch / batch_len,
+                        "lr": optimizer.param_groups[0]['lr'],
+                        "epoch": epoch
+                    }
+                    
+                    # Add diagnostics if available
+                    if enable_diagnostics and len(diagnostics_list) > 0:
+                        # Average diagnostics across batch items
+                        avg_diag = {}
+                        for key in diagnostics_list[0].keys():
+                            if isinstance(diagnostics_list[0][key], dict):
+                                # Nested dict (e.g., 'point_feats', 'scores', etc.)
+                                avg_diag[key] = {}
+                                for subkey in diagnostics_list[0][key].keys():
+                                    if subkey != 'score_linear_grad_norm':  # This is set after backward
+                                        values = [d[key][subkey] for d in diagnostics_list if key in d and subkey in d[key]]
+                                        if values:
+                                            avg_diag[key][subkey] = sum(values) / len(values)
+                            elif key.startswith('head_'):
+                                # Per-head statistics
+                                avg_diag[key] = {}
+                                for subkey in diagnostics_list[0][key].keys():
                                     values = [d[key][subkey] for d in diagnostics_list if key in d and subkey in d[key]]
                                     if values:
                                         avg_diag[key][subkey] = sum(values) / len(values)
-                        elif key.startswith('head_'):
-                            # Per-head statistics
-                            avg_diag[key] = {}
-                            for subkey in diagnostics_list[0][key].keys():
-                                values = [d[key][subkey] for d in diagnostics_list if key in d and subkey in d[key]]
-                                if values:
-                                    avg_diag[key][subkey] = sum(values) / len(values)
-                        elif key in ['num_points', 'num_clusters']:
-                            # Use first value (should be same across batch)
-                            avg_diag[key] = diagnostics_list[0][key]
+                            elif key in ['num_points', 'num_clusters']:
+                                # Use first value (should be same across batch)
+                                avg_diag[key] = diagnostics_list[0][key]
+                        
+                        # Get gradient norm from first item (should be same after optimizer.step())
+                        if diagnostics_list[0].get('score_linear_grad_norm') is not None:
+                            avg_diag['score_linear_grad_norm'] = diagnostics_list[0]['score_linear_grad_norm']
+                        if diagnostics_list[0].get('score_linear_weight_norm') is not None:
+                            avg_diag['score_linear_weight_norm'] = diagnostics_list[0]['score_linear_weight_norm']
+                        
+                        # Flatten nested dicts for wandb logging
+                        for key, value in avg_diag.items():
+                            if isinstance(value, dict):
+                                for subkey, subvalue in value.items():
+                                    log_dict[f"diagnostics/{key}/{subkey}"] = subvalue
+                            else:
+                                log_dict[f"diagnostics/{key}"] = value
+                        
+                        # Print diagnostics summary
+                        if accelerator.is_main_process:
+                            print(f"\n[Diagnostics] Step {step}:")
+                            if 'point_feats' in avg_diag:
+                                pf = avg_diag['point_feats']
+                                print(f"  Point Features: mean={pf.get('mean', 0):.6f}, std={pf.get('std', 0):.6f}, "
+                                      f"min={pf.get('min', 0):.6f}, max={pf.get('max', 0):.6f}")
+                            if 'scores' in avg_diag:
+                                sc = avg_diag['scores']
+                                print(f"  Scores (logits, raw): mean={sc.get('mean', 0):.6f}, std={sc.get('std', 0):.6f}, "
+                                      f"min={sc.get('min', 0):.6f}, max={sc.get('max', 0):.6f}")
+                            if 'scores_scaled' in avg_diag:
+                                scs = avg_diag['scores_scaled']
+                                print(f"  Scores (logits, scaled): mean={scs.get('mean', 0):.6f}, std={scs.get('std', 0):.6f}, "
+                                      f"min={scs.get('min', 0):.6f}, max={scs.get('max', 0):.6f}")
+                            if 'attention_scores' in avg_diag:
+                                att = avg_diag['attention_scores']
+                                print(f"  Attention (alpha): mean={att.get('mean', 0):.6f}, std={att.get('std', 0):.6f}, "
+                                      f"min={att.get('min', 0):.6f}, max={att.get('max', 0):.6f}")
+                            for h in range(4):  # Assuming 4 heads
+                                head_key = f'head_{h}'
+                                if head_key in avg_diag:
+                                    hd = avg_diag[head_key]
+                                    print(f"  Head {h}: mean={hd.get('mean', 0):.6f}, std={hd.get('std', 0):.6f}, "
+                                          f"min={hd.get('min', 0):.6f}, max={hd.get('max', 0):.6f}")
+                            if 'score_linear_grad_norm' in avg_diag:
+                                print(f"  Score Linear Grad Norm: {avg_diag['score_linear_grad_norm']:.8f}")
+                            if 'score_linear_weight_norm' in avg_diag:
+                                print(f"  Score Linear Weight Norm: {avg_diag['score_linear_weight_norm']:.8f}")
+                            print()
                     
-                    # Get gradient norm from first item (should be same after optimizer.step())
-                    if diagnostics_list[0].get('score_linear_grad_norm') is not None:
-                        avg_diag['score_linear_grad_norm'] = diagnostics_list[0]['score_linear_grad_norm']
-                    if diagnostics_list[0].get('score_linear_weight_norm') is not None:
-                        avg_diag['score_linear_weight_norm'] = diagnostics_list[0]['score_linear_weight_norm']
+                    accelerator.log(log_dict, step=step)
                     
-                    # Flatten nested dicts for wandb logging
-                    for key, value in avg_diag.items():
-                        if isinstance(value, dict):
-                            for subkey, subvalue in value.items():
-                                log_dict[f"diagnostics/{key}/{subkey}"] = subvalue
-                        else:
-                            log_dict[f"diagnostics/{key}"] = value
+                    # Clear diagnostics list after logging
+                    diagnostics_list.clear()
                     
-                    # Print diagnostics summary
-                    if accelerator.is_main_process:
-                        print(f"\n[Diagnostics] Step {step}:")
-                        if 'point_feats' in avg_diag:
-                            pf = avg_diag['point_feats']
-                            print(f"  Point Features: mean={pf.get('mean', 0):.6f}, std={pf.get('std', 0):.6f}, "
-                                  f"min={pf.get('min', 0):.6f}, max={pf.get('max', 0):.6f}")
-                        if 'scores' in avg_diag:
-                            sc = avg_diag['scores']
-                            print(f"  Scores (logits, raw): mean={sc.get('mean', 0):.6f}, std={sc.get('std', 0):.6f}, "
-                                  f"min={sc.get('min', 0):.6f}, max={sc.get('max', 0):.6f}")
-                        if 'scores_scaled' in avg_diag:
-                            scs = avg_diag['scores_scaled']
-                            print(f"  Scores (logits, scaled): mean={scs.get('mean', 0):.6f}, std={scs.get('std', 0):.6f}, "
-                                  f"min={scs.get('min', 0):.6f}, max={scs.get('max', 0):.6f}")
-                        if 'attention_scores' in avg_diag:
-                            att = avg_diag['attention_scores']
-                            print(f"  Attention (alpha): mean={att.get('mean', 0):.6f}, std={att.get('std', 0):.6f}, "
-                                  f"min={att.get('min', 0):.6f}, max={att.get('max', 0):.6f}")
-                        for h in range(4):  # Assuming 4 heads
-                            head_key = f'head_{h}'
-                            if head_key in avg_diag:
-                                hd = avg_diag[head_key]
-                                print(f"  Head {h}: mean={hd.get('mean', 0):.6f}, std={hd.get('std', 0):.6f}, "
-                                      f"min={hd.get('min', 0):.6f}, max={hd.get('max', 0):.6f}")
-                        if 'score_linear_grad_norm' in avg_diag:
-                            print(f"  Score Linear Grad Norm: {avg_diag['score_linear_grad_norm']:.8f}")
-                        if 'score_linear_weight_norm' in avg_diag:
-                            print(f"  Score Linear Weight Norm: {avg_diag['score_linear_weight_norm']:.8f}")
-                        print()
+                pbar.set_postfix({
+                    'loss': f"{total_loss_batch:.4f}",
+                    'cham': f"{loss_chamfer_batch / batch_len:.4f}",
+                    'rend': f"{loss_render_batch / batch_len:.4f}",
+                    'mat': f"{loss_mat_batch / batch_len:.4f}",
+                    'kl': f"{loss_kl_batch / batch_len:.6f}"
+                })
                 
-                accelerator.log(log_dict, step=step)
-                
-                # Clear diagnostics list after logging
-                diagnostics_list.clear()
-                
-            pbar.set_postfix({
-                'loss': f"{total_loss_batch:.4f}",
-                'cham': f"{loss_chamfer_batch / batch_len:.4f}",
-                'rend': f"{loss_render_batch / batch_len:.4f}",
-                'mat': f"{loss_mat_batch / batch_len:.4f}",
-                'kl': f"{loss_kl_batch / batch_len:.6f}"
-            })
-            
-            # Release batch-level tensors after logging
-            del scan_points
-            if scan_normals is not None:
-                del scan_normals
-            del base_verts_list, base_faces_list, base_normals_list, gt_verts_list, gt_faces_list
-            if torch.cuda.is_available() and (step % 50 == 0):
-                torch.cuda.empty_cache()
+                # Release batch-level tensors after logging
+                del scan_points
+                if scan_normals is not None:
+                    del scan_normals
+                del base_verts_list, base_faces_list, base_normals_list, gt_verts_list, gt_faces_list
+                if torch.cuda.is_available() and (step % 50 == 0):
+                    torch.cuda.empty_cache()
 
-            t_end = time.time()
+                t_end = time.time()
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    oom_count += 1
+                    if accelerator.is_main_process:
+                        print(f"[Warn] CUDA OOM at epoch {epoch}, step {step}. Skipping this batch. OOM count in this epoch: {oom_count}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if oom_count >= 3:
+                        raise RuntimeError(f"CUDA OOM occurred {oom_count} times in epoch {epoch}. Exiting training.")
+                    continue
+                else:
+                    raise
             
         # Update Scheduler
         scheduler.step()
