@@ -1,146 +1,320 @@
 import os
+import sys
 import argparse
 import torch
 import trimesh
 import numpy as np
-import open3d as o3d
 import yaml
+import json
+import pickle
 from tqdm import tqdm
+from PIL import Image
 
+# Add current directory to path for models and utils
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Import Stage 2 components
 from models.pipeline import Stage2Pipeline
+from data.stage2_dataset import ScanToMeshDataset, stage2_collate_fn
+from utils.render import DifferentiableNormalRenderer
 
-# EdgeRunner/core/utils.py style normalization
-def normalize_mesh(vertices, bound=0.95):
-    vmin = vertices.min(0)
-    vmax = vertices.max(0)
-    ori_center = (vmax + vmin) / 2
-    ori_scale = 2 * bound / np.max(vmax - vmin)
-    vertices = (vertices - ori_center) * ori_scale
-    return vertices
+# --- EdgeRunner Integration ---
+EDGE_RUNNER_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'EdgeRunner')
+sys.path.insert(0, EDGE_RUNNER_ROOT)
+sys.path.insert(0, os.path.join(EDGE_RUNNER_ROOT, 'models'))
 
-def normalize_mesh_o3d(mesh, bound=0.95):
-    # Convert to numpy to use the same logic
-    verts = np.asarray(mesh.vertices)
-    verts = normalize_mesh(verts, bound=bound) 
-    mesh.vertices = o3d.utility.Vector3dVector(verts)
-    return mesh
+try:
+    from core.models import LMM
+    from core.options import config_defaults
+    from core.utils import load_mesh, get_tokenizer, monkey_patch_transformers
+    from core.transformer.point import PointEncoderEmbed
+    from kiui.mesh_utils import clean_mesh
+    from safetensors.torch import load_file
+    monkey_patch_transformers()
+    _HAS_EDGERUNNER = True
+except ImportError as e:
+    print(f"[Warning] EdgeRunner dependencies not found: {e}")
+    _HAS_EDGERUNNER = False
+
+class EdgeRunnerWrapper:
+    def __init__(self, checkpoint_path, config_name='ArAE', device='cuda'):
+        self.device = torch.device(device)
+        self.opt = config_defaults[config_name]
+        self.opt.checkpointing = False
+        
+        print(f'[EdgeRunner] Loading model from {checkpoint_path}')
+        self.model = LMM(self.opt)
+        
+        if checkpoint_path.endswith('safetensors'):
+            ckpt = load_file(checkpoint_path, device='cpu')
+        else:
+            ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        
+        self.model.load_state_dict(ckpt, strict=False)
+        self.model = self.model.half().eval().to(self.device)
+        self.tokenizer, _ = get_tokenizer(self.opt)
+        
+        self.encoder = PointEncoderEmbed(
+            hidden_dim=self.opt.point_hidden_dim,
+            num_heads=self.opt.point_num_heads,
+            latent_size=self.opt.point_latent_size,
+            latent_dim=self.opt.point_latent_dim,
+            gradient_checkpointing=False,
+        )
+        encoder_state_dict = {}
+        for key, value in ckpt.items():
+            if key.startswith('point_encoder.'):
+                new_key = key.replace('point_encoder.', '')
+                encoder_state_dict[new_key] = value
+        self.encoder.load_state_dict(encoder_state_dict, strict=True)
+        self.encoder = self.encoder.half().eval().to(self.device)
+
+    @torch.no_grad()
+    def encode_points(self, points):
+        points_tensor = torch.from_numpy(points).unsqueeze(0).float().to(self.device)
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            posterior = self.encoder(points_tensor)
+            embedding = posterior.mode()
+        return embedding
+
+    @torch.no_grad()
+    def generate_mesh(self, embedding, num_faces=2000):
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            original_cond_mode = self.model.opt.cond_mode
+            self.model.opt.cond_mode = 'point_latent'
+            meshes, _ = self.model.generate(
+                embedding.half(),
+                num_faces=num_faces,
+                tokenizer=self.tokenizer,
+                clean=True
+            )
+            self.model.opt.cond_mode = original_cond_mode
+        return meshes[0]
+
+# --- Utilities ---
+
+def stage2_normalize(verts_np):
+    bbox_min = verts_np.min(axis=0)
+    bbox_max = verts_np.max(axis=0)
+    center = (bbox_min + bbox_max) / 2
+    verts_centered = verts_np - center
+    scale = np.max(np.linalg.norm(verts_centered, axis=1))
+    if scale < 1e-6: scale = 1.0
+    verts_norm = verts_centered / scale
+    return verts_norm, center, scale
+
+def apply_normalization(verts_np, center, scale):
+    return (verts_np - center) / scale
+
+def load_stage2_config(checkpoint_path):
+    config_path = os.path.join(os.path.dirname(checkpoint_path), "config.yaml")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config not found at {config_path}")
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, help="Path to config.yaml (from checkpoint)")
-    parser.add_argument('--checkpoint', type=str, required=True, help="Path to model checkpoint (.pth)")
-    parser.add_argument('--input_scan', type=str, required=True, help="Path to input scan (.obj/.ply/.pt)")
-    parser.add_argument('--output_dir', type=str, default="results", help="Output directory")
-    parser.add_argument('--base_faces', type=int, default=2000, help="Target base mesh vertices")
-    parser.add_argument('--point_num', type=int, default=320000, help="Number of scan points to sample")
+    parser = argparse.ArgumentParser(description="Stage 2 Inference Script")
+    parser.add_argument('--checkpoint', type=str, required=True, help="Path to Stage 2 checkpoint (.pth)")
+    parser.add_argument('--mode', type=str, choices=['gt_simplified', 'edgerunner'], default='gt_simplified')
+    parser.add_argument('--data_source', type=str, choices=['dataset', 'single'], default='dataset')
+    parser.add_argument('--input_path', type=str, help="Path to dataset processed_dir or single obj")
+    parser.add_argument('--edgerunner_ckpt', type=str, help="Path to EdgeRunner checkpoint")
+    parser.add_argument('--test_num_face', type=int, default=2000)
+    parser.add_argument('--use_cached', action='store_true')
+    parser.add_argument('--output_dir', type=str, default="test_results")
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--render_size', type=int)
+    parser.add_argument('--render_views', type=int)
+    
     args = parser.parse_args()
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(args.output_dir, exist_ok=True)
-
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    
     # 1. Load Config & Model
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    config = load_stage2_config(args.checkpoint)
+    exp_name = config.get('experiment_name', 'default_exp')
     
-    print(f"Loading model from {args.checkpoint}...")
-    model = Stage2Pipeline(config={
-        'feature_dim': config['model']['feature_dim'],
-        'enc_hidden_dim': config['model']['enc_hidden_dim'],
-        'dec_hidden_dim': config['model']['dec_hidden_dim'],
-        'subdivision_levels': config['model']['subdivision_levels'],
-        'subdivision_rate': config['model']['subdivision_rate']
-    }).to(device)
+    # Final Output Structure
+    final_output_dir = os.path.join(args.output_dir, exp_name)
+    fine_mesh_out_dir = os.path.join(final_output_dir, "fine_meshs")
+    os.makedirs(fine_mesh_out_dir, exist_ok=True)
     
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    # Handle if checkpoint saves 'model_state_dict' or just dict
+    # Special Folders
+    EXAMPLES_DIR = "/mnt/lab/data/yeruisi/data/compression/examples"
+    GT_EXPORT_DIR = os.path.join(EXAMPLES_DIR, "GT_meshes")
+    ER_CACHE_DIR = os.path.join(EXAMPLES_DIR, "EdgeRunner_basemesh")
+    
+    SHOULD_EXPORT_GT = False
+    if not os.path.exists(GT_EXPORT_DIR):
+        os.makedirs(GT_EXPORT_DIR, exist_ok=True)
+        SHOULD_EXPORT_GT = True
+
+    if args.render_size: config['render']['image_size'] = args.render_size
+    if args.render_views: config['render']['views_per_sample'] = args.render_views
+    
+    model = Stage2Pipeline(config=config['model']).to(device)
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
     model.load_state_dict(state_dict)
     model.eval()
-
-    # 2. Process Input Scan
-    print(f"Processing scan: {args.input_scan}")
     
-    if args.input_scan.endswith('.pt'):
-        print(f"Loading from .pt file...")
-        data = torch.load(args.input_scan, map_location='cpu', weights_only=False)
-        verts = data['gt_verts'].numpy()
-        faces = data['gt_faces'].numpy()
-        
-        scan_mesh = o3d.geometry.TriangleMesh()
-        scan_mesh.vertices = o3d.utility.Vector3dVector(verts)
-        scan_mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    er_wrapper = None
+    if args.mode == 'edgerunner':
+        if not _HAS_EDGERUNNER:
+            raise ImportError("EdgeRunner dependencies not found.")
+        if not args.use_cached:
+            if not args.edgerunner_ckpt:
+                raise ValueError("edgerunner mode requires --edgerunner_ckpt if not using cache")
+            er_wrapper = EdgeRunnerWrapper(args.edgerunner_ckpt, device=args.device)
+
+    # 3. Setup Data
+    data_root = args.input_path if args.input_path else config['data']['processed_dir']
+    samples = []
+    base_usage_info = []
+    
+    if args.data_source == 'dataset':
+        if args.mode == 'gt_simplified':
+            test_base_json = os.path.join(data_root, 'test_base.json')
+            if os.path.exists(test_base_json):
+                with open(test_base_json, 'r') as f:
+                    file_list = json.load(f)
+                for item in file_list:
+                    if "_base_0_" in item['base_pt_path']:
+                        samples.append({
+                            'name': os.path.splitext(os.path.basename(item['gt_pt_path']))[0],
+                            'gt_path': item['gt_pt_path'],
+                            'base_path': os.path.join(config['data']['preprocessed_base_mesh_dir'], item['base_pt_path'])
+                        })
+            else:
+                test_json = os.path.join(data_root, 'test.json')
+                with open(test_json, 'r') as f:
+                    file_list = json.load(f)
+                for item in file_list:
+                    samples.append({
+                        'name': os.path.splitext(os.path.basename(item['pt_path']))[0],
+                        'gt_path': os.path.join(data_root, item['pt_path']),
+                        'base_path': None
+                    })
+        elif args.mode == 'edgerunner':
+            if args.use_cached:
+                er_json = os.path.join(ER_CACHE_DIR, "base_meshs.json")
+                if os.path.exists(er_json):
+                    with open(er_json, 'r') as f:
+                        samples = json.load(f)
+                else:
+                    raise FileNotFoundError(f"EdgeRunner cache not found at {er_json}")
+            else:
+                test_json = os.path.join(data_root, 'test.json')
+                with open(test_json, 'r') as f:
+                    file_list = json.load(f)
+                for item in file_list:
+                    samples.append({
+                        'name': os.path.splitext(os.path.basename(item['pt_path']))[0],
+                        'gt_path': os.path.join(data_root, item['pt_path'])
+                    })
     else:
-        # Load using Open3D for consistency with dataset simplification
-        scan_mesh = o3d.io.read_triangle_mesh(args.input_scan)
-    
-    # Normalize (Critical!)
-    # Note: This assumes input is raw scan. If input is already normalized, skip this.
-    scan_mesh = normalize_mesh_o3d(scan_mesh, bound=0.95)
-    
-    # 3. Generate Base Mesh (Simplify)
-    print(f"Simplifying to ~{args.base_faces} vertices...")
-    base_mesh = scan_mesh.simplify_quadric_decimation(target_number_of_triangles=args.base_faces)
-    base_mesh.compute_vertex_normals()
-    
-    # 4. Sample Points (using Trimesh for consistency)
-    # Convert Open3D -> Trimesh
-    # (Or just write temp and read back to be safe)
-    v_base = np.asarray(base_mesh.vertices).astype(np.float32)
-    f_base = np.asarray(base_mesh.triangles).astype(np.int64)
-    n_base = np.asarray(base_mesh.vertex_normals).astype(np.float32)
-    
-    # For sampling, we need the high-res scan as Trimesh
-    v_scan = np.asarray(scan_mesh.vertices)
-    f_scan = np.asarray(scan_mesh.triangles)
-    tm_scan = trimesh.Trimesh(vertices=v_scan, faces=f_scan, process=False)
-    
-    print(f"Sampling {args.point_num} points...")
-    scan_points, _ = trimesh.sample.sample_surface(tm_scan, args.point_num)
-    scan_points = scan_points.astype(np.float32)
-    
-    # 5. Prepare Tensors
-    # Add batch dim
-    base_verts_t = torch.from_numpy(v_base).unsqueeze(0).to(device)
-    base_faces_t = torch.from_numpy(f_base).unsqueeze(0).to(device)
-    base_normals_t = torch.from_numpy(n_base).unsqueeze(0).to(device)
-    scan_points_t = torch.from_numpy(scan_points).unsqueeze(0).to(device)
-    
-    # 6. Inference
-    print("Running inference...")
-    
-    # Debug: Check inputs
-    print(f"Input Stats:")
-    print(f"  Base Verts: min={base_verts_t.min():.4f}, max={base_verts_t.max():.4f}")
-    print(f"  Scan Points: min={scan_points_t.min():.4f}, max={scan_points_t.max():.4f}")
-    
-    with torch.no_grad():
-        # Forward
-        fine_verts, fine_faces, disp = model(base_verts_t, base_faces_t, base_normals_t, scan_points_t)
-        
-        # Debug: Check outputs
-        print(f"Output Stats:")
-        print(f"  Disp: min={disp.min():.6f}, max={disp.max():.6f}, mean={disp.abs().mean():.6f}")
-        print(f"  Fine Verts: {fine_verts.shape}")
-        
-    # 7. Export Results
-    # fine_verts: (1, V_fine, 3)
-    # fine_faces: (F_fine, 3) (Shared topology)
-    
-    out_verts = fine_verts[0].cpu().numpy()
-    out_faces = fine_faces.cpu().numpy()
-    
-    # Export Base Mesh
-    o3d.io.write_triangle_mesh(os.path.join(args.output_dir, "base_mesh.obj"), base_mesh)
-    
-    # Export Fine Mesh
-    fine_mesh = trimesh.Trimesh(vertices=out_verts, faces=out_faces, process=False)
-    fine_mesh.export(os.path.join(args.output_dir, "fine_mesh.obj"))
-    
-    # Export GT (Normalized) for comparison
-    o3d.io.write_triangle_mesh(os.path.join(args.output_dir, "gt_normalized.obj"), scan_mesh)
-    
-    print(f"Results saved to {args.output_dir}")
-    print(f"Base Verts: {len(v_base)}, Fine Verts: {len(out_verts)}")
+        samples.append({
+            'name': os.path.splitext(os.path.basename(args.input_path))[0],
+            'gt_path': args.input_path,
+            'base_path': None
+        })
 
-if __name__ == '__main__':
-    main()
+    renderer = DifferentiableNormalRenderer(
+        image_size=config['render']['image_size'],
+        device=device,
+        cameras_per_batch=config['render']['views_per_sample'],
+        dist_multiplier=config['render'].get('dist_multiplier', 1.0)
+    )
+
+    # 5. Inference Loop
+    for sample in tqdm(samples, desc="Inference"):
+        name = sample['name']
+        gt_path = sample['gt_path']
+        
+        # Load GT
+        if gt_path.endswith('.pt'):
+            gt_data = torch.load(gt_path, map_location='cpu', weights_only=False)
+            gt_v, gt_f = gt_data['gt_verts'].numpy(), gt_data['gt_faces'].numpy()
+        else:
+            gt_mesh = trimesh.load(gt_path, process=False)
+            gt_v, gt_f = gt_mesh.vertices, gt_mesh.faces
+            
+        if SHOULD_EXPORT_GT:
+            gt_obj_path = os.path.join(GT_EXPORT_DIR, f"{name}.obj")
+            if not os.path.exists(gt_obj_path):
+                trimesh.Trimesh(vertices=gt_v, faces=gt_f).export(gt_obj_path)
+
+        gt_v_norm, center, scale = stage2_normalize(gt_v)
+        
+        # Get Base Mesh
+        if args.mode == 'gt_simplified':
+            base_path = sample.get('base_path')
+            if base_path and os.path.exists(base_path):
+                base_data = torch.load(base_path, map_location='cpu', weights_only=False)
+                base_v = apply_normalization(base_data['base_verts'].numpy().astype(np.float32), center, scale)
+                base_f = base_data['base_faces'].numpy().astype(np.int64)
+                base_usage_info.append({"name": name, "base_path": base_path})
+            else:
+                import open3d as o3d
+                o3d_m = o3d.geometry.TriangleMesh()
+                o3d_m.vertices, o3d_m.triangles = o3d.utility.Vector3dVector(gt_v_norm), o3d.utility.Vector3iVector(gt_f.astype(np.int32))
+                base_mesh_o3d = o3d_m.simplify_quadric_decimation(target_number_of_triangles=args.test_num_face)
+                base_v, base_f = np.asarray(base_mesh_o3d.vertices, dtype=np.float32), np.asarray(base_mesh_o3d.triangles, dtype=np.int64)
+                base_usage_info.append({"name": name, "base_path": "simplified_on_the_fly"})
+            
+        elif args.mode == 'edgerunner':
+            os.makedirs(ER_CACHE_DIR, exist_ok=True)
+            c_obj, c_pkl = os.path.join(ER_CACHE_DIR, f"{name}_base.obj"), os.path.join(ER_CACHE_DIR, f"{name}_emb.pkl")
+            
+            if args.use_cached and os.path.exists(c_obj):
+                bm = trimesh.load(c_obj, process=False)
+                base_v, base_f = apply_normalization(bm.vertices, center, scale), bm.faces
+            else:
+                gt_tm = trimesh.Trimesh(vertices=gt_v, faces=gt_f, process=False)
+                points = gt_tm.sample(160000)
+                pm, pM = points.min(0), points.max(0)
+                pc, ps = (pM + pm) / 2, 2 * 0.95 / np.max(pM - pm)
+                emb = er_wrapper.encode_points((points - pc) * ps)
+                bm_er = er_wrapper.generate_mesh(emb, num_faces=args.test_num_face)
+                with open(c_pkl, 'wb') as f: pickle.dump(emb.cpu().numpy(), f)
+                world_v = bm_er.vertices / ps + pc
+                trimesh.Trimesh(vertices=world_v, faces=bm_er.faces).export(c_obj)
+                base_v, base_f = apply_normalization(world_v, center, scale), bm_er.faces
+            base_usage_info.append({"name": name, "gt_path": gt_path, "base_path": c_obj, "emb_path": c_pkl})
+
+        # Stage 2 Inference
+        import open3d as o3d
+        o3d_m = o3d.geometry.TriangleMesh()
+        o3d_m.vertices, o3d_m.triangles = o3d.utility.Vector3dVector(base_v), o3d.utility.Vector3iVector(base_f.astype(np.int32))
+        o3d_m.compute_vertex_normals()
+        base_n = np.asarray(o3d_m.vertex_normals, dtype=np.float32)
+        scan_points, _ = trimesh.sample.sample_surface(trimesh.Trimesh(vertices=gt_v_norm, faces=gt_f, process=False), config['data']['point_num'])
+        
+        # Prepare Tensors
+        # Ensure float32 for vertex/normal/scan data, and long for faces
+        b_v = torch.from_numpy(base_v).float().unsqueeze(0).to(device).contiguous()
+        b_f = torch.from_numpy(base_f).long().unsqueeze(0).to(device).contiguous()
+        b_n = torch.from_numpy(base_n).float().unsqueeze(0).to(device).contiguous()
+        b_s = torch.from_numpy(scan_points).float().unsqueeze(0).to(device).contiguous()
+
+        with torch.no_grad():
+            fv, ff, _, _, _, _ = model(b_v, b_f, b_n, b_s)
+            
+        trimesh.Trimesh(vertices=fv[0].cpu().numpy(), faces=ff.cpu().numpy(), process=False).export(os.path.join(fine_mesh_out_dir, f"{name}_fine.obj"))
+
+        if args.render_views and args.render_views > 0:
+            gv, gf = torch.from_numpy(gt_v_norm).unsqueeze(0).to(device), torch.from_numpy(gt_f).unsqueeze(0).to(device)
+            pi, gi = renderer(fv, ff.unsqueeze(0), gv, gf)
+            rd = os.path.join(final_output_dir, "renders", name)
+            os.makedirs(rd, exist_ok=True)
+            for i in range(min(4, pi.shape[0])):
+                img = Image.fromarray(((pi[i].cpu().numpy() + 1.0) * 0.5 * 255).clip(0, 255).astype(np.uint8))
+                img.save(os.path.join(rd, f"view_{i}.png"))
+
+    with open(os.path.join(final_output_dir, "base_meshs.json"), 'w') as f: json.dump(base_usage_info, f, indent=4)
+    if args.mode == 'edgerunner' and not args.use_cached:
+        with open(os.path.join(ER_CACHE_DIR, "base_meshs.json"), 'w') as f: json.dump(base_usage_info, f, indent=4)
+    print(f"Inference complete. Results in {final_output_dir}")
+
+if __name__ == '__main__': main()

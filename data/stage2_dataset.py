@@ -1,4 +1,5 @@
 import os
+import glob
 import torch
 import json
 import trimesh
@@ -26,7 +27,9 @@ class ScanToMeshDataset(Dataset):
     def __init__(self, data_root, split='train', point_num=320000, 
                  base_faces_min=2000, base_faces_max=6000, 
                  backend='open3d', debug_export=False,
-                 preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False):
+                 preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False, 
+                 preload_ram=False, lmdb_path=None, use_scan_normal=False,
+                 dataset_type='human'):
         """
         Args:
             data_root: 预处理数据目录
@@ -36,15 +39,23 @@ class ScanToMeshDataset(Dataset):
             debug_export: 是否导出第0个样本的中间结果用于检查
             preprocessed_base_mesh_dir: Base Mesh 预处理目录 (可选)
             use_preprocess_base_mesh: 是否使用预处理的 Base Mesh
+            preload_ram: 是否将所有数据预加载到内存中 (解决 IO 瓶颈)
+            lmdb_path: 预打包的 LMDB 数据库路径 (推荐使用)
+            dataset_type: 'human' (默认) 或 'thingi10k'
         """
         self.data_root = data_root
         self.split = split
+        self.dataset_type = dataset_type
         self.point_num = point_num
         self.base_faces_range = (base_faces_min, base_faces_max)
         self.backend = backend
         self.debug_export = debug_export
         self.use_preprocess_base_mesh = use_preprocess_base_mesh
         self.preprocessed_base_mesh_dir = preprocessed_base_mesh_dir
+        self.preload_ram = preload_ram
+        self.lmdb_path = lmdb_path
+        self.use_scan_normal = use_scan_normal
+        self.lmdb_env = None
         
         if self.backend == 'pyfqmr' and not _HAS_PYFQMR:
             print("[Warning] pyfqmr not found, falling back to open3d")
@@ -74,10 +85,19 @@ class ScanToMeshDataset(Dataset):
         
         json_path = os.path.join(data_root, f"{split}.json")
         if not os.path.exists(json_path):
-            raise FileNotFoundError(f"Index file not found: {json_path}")
-            
-        with open(json_path, 'r') as f:
-            self.file_list = json.load(f)
+            if self.dataset_type == 'thingi10k':
+                # Thingi10k: 如果没有索引文件，自动扫描目录中的 .pt 文件生成列表
+                print(f"[Dataset] {json_path} 不存在，自动扫描 {data_root} 中的 .pt 文件...")
+                pt_files = sorted(glob.glob(os.path.join(data_root, "*.pt")))
+                if len(pt_files) == 0:
+                    raise FileNotFoundError(f"No .pt files found in {data_root}")
+                self.file_list = [{'pt_path': os.path.basename(f)} for f in pt_files]
+                print(f"[Dataset] 自动扫描到 {len(self.file_list)} 个 .pt 文件")
+            else:
+                raise FileNotFoundError(f"Index file not found: {json_path}")
+        else:
+            with open(json_path, 'r') as f:
+                self.file_list = json.load(f)
             
         # Build a mapping from GT pt filename to list of base meshes
         if self.use_preprocess_base_mesh:
@@ -91,7 +111,72 @@ class ScanToMeshDataset(Dataset):
                     self.gt_to_base[gt_basename] = []
                 self.gt_to_base[gt_basename].append(entry)
             
-        print(f"[Dataset] Loaded {len(self.file_list)} samples for {split} | Backend: {self.backend} | Preprocessed Base: {self.use_preprocess_base_mesh}")
+        print(f"[Dataset] Loaded {len(self.file_list)} samples for {split} | Type: {self.dataset_type} | Backend: {self.backend} | Preprocessed Base: {self.use_preprocess_base_mesh}")
+
+        # --- LMDB Setup ---
+        if self.lmdb_path and os.path.exists(self.lmdb_path):
+             import lmdb
+             # Open read-only, no lock
+             self.lmdb_env = lmdb.open(self.lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
+             print(f"[Dataset] Using LMDB: {self.lmdb_path}")
+
+        # --- Preload to RAM ---
+        self.gt_cache = {}
+        self.base_cache = {}
+        
+        # Only preload if NOT using LMDB (or if user explicitly wants to load LMDB into RAM which is usually unnecessary as OS does it)
+        # But if preload_ram is True, we can load FROM LMDB to RAM to be even faster.
+        if self.preload_ram:
+             from tqdm import tqdm
+             if self.lmdb_env:
+                 print("[Dataset] Preloading all data from LMDB to RAM...")
+                 import pickle
+                 with self.lmdb_env.begin(write=False) as txn:
+                     # Load GT
+                     for i in tqdm(range(len(self.file_list))):
+                         key = f"gt_{i}".encode()
+                         buf = txn.get(key)
+                         if buf:
+                             pt_path = os.path.join(self.data_root, self.file_list[i]['pt_path'])
+                             self.gt_cache[pt_path] = pickle.loads(buf)
+                     
+                     # Load Base
+                     if self.use_preprocess_base_mesh and self.base_file_list:
+                         for entry in tqdm(self.base_file_list):
+                             rel_path = entry['base_pt_path']
+                             key = f"base_{rel_path}".encode()
+                             buf = txn.get(key)
+                             if buf:
+                                 full_path = os.path.join(self.preprocessed_base_mesh_dir, rel_path)
+                                 self.base_cache[full_path] = pickle.loads(buf)
+                 print(f"[Dataset] LMDB Preload complete.")
+                 
+             else:
+                print("[Dataset] Preloading all data to RAM from DISK... This may take a while.")
+                from tqdm import tqdm
+                
+                # 1. Preload GT
+                print("  - Loading GT Meshes...")
+                for item in tqdm(self.file_list):
+                    pt_path = os.path.join(self.data_root, item['pt_path'])
+                    if pt_path not in self.gt_cache:
+                        try:
+                            self.gt_cache[pt_path] = torch.load(pt_path, weights_only=False)
+                        except Exception as e:
+                            print(f"[Warning] Failed to load {pt_path}: {e}")
+                
+                # 2. Preload Base (if used)
+                if self.use_preprocess_base_mesh and self.base_file_list:
+                    print("  - Loading Base Meshes...")
+                    for entry in tqdm(self.base_file_list):
+                        base_pt_full_path = os.path.join(self.preprocessed_base_mesh_dir, entry['base_pt_path'])
+                        if base_pt_full_path not in self.base_cache:
+                            try:
+                                self.base_cache[base_pt_full_path] = torch.load(base_pt_full_path, weights_only=False)
+                            except Exception as e:
+                                print(f"[Warning] Failed to load {base_pt_full_path}: {e}")
+                                
+                print(f"[Dataset] Preload complete. GT Cache: {len(self.gt_cache)}, Base Cache: {len(self.base_cache)}")
 
     def __len__(self):
         return len(self.file_list)
@@ -103,7 +188,21 @@ class ScanToMeshDataset(Dataset):
         
         # Load GT Data
         # GT Data is needed for sampling scan points (always)
-        data = torch.load(pt_path, weights_only=False)
+        if self.preload_ram and pt_path in self.gt_cache:
+            data = self.gt_cache[pt_path]
+        elif self.lmdb_env:
+            import pickle
+            with self.lmdb_env.begin(write=False) as txn:
+                key = f"gt_{idx}".encode()
+                buf = txn.get(key)
+                if buf:
+                    data = pickle.loads(buf)
+                else:
+                    # Fallback
+                    data = torch.load(pt_path, weights_only=False)
+        else:
+            data = torch.load(pt_path, weights_only=False)
+            
         gt_verts_np = data['gt_verts'].numpy()
         gt_faces_np = data['gt_faces'].numpy()
         
@@ -126,8 +225,12 @@ class ScanToMeshDataset(Dataset):
         
         # 1. Online Sampling (Trimesh is good for sampling)
         tm_mesh = trimesh.Trimesh(vertices=gt_verts_np, faces=gt_faces_np, process=False)
-        scan_points, _ = trimesh.sample.sample_surface(tm_mesh, self.point_num)
+        scan_points, sampled_face_idx = trimesh.sample.sample_surface(tm_mesh, self.point_num)
         scan_points = scan_points.astype(np.float32)
+        scan_normals = None
+        if self.use_scan_normal:
+            # Use source face normals from fine mesh (not estimated from sampled point cloud).
+            scan_normals = tm_mesh.face_normals[sampled_face_idx].astype(np.float32)
         t2 = time.time()
         
         base_verts_np = None
@@ -155,7 +258,20 @@ class ScanToMeshDataset(Dataset):
                 base_pt_full_path = os.path.join(self.preprocessed_base_mesh_dir, selected['base_pt_path'])
                 
                 try:
-                    base_data = torch.load(base_pt_full_path, weights_only=False)
+                    if self.preload_ram and base_pt_full_path in self.base_cache:
+                        base_data = self.base_cache[base_pt_full_path]
+                    elif self.lmdb_env:
+                         import pickle
+                         with self.lmdb_env.begin(write=False) as txn:
+                             key = f"base_{selected['base_pt_path']}".encode()
+                             buf = txn.get(key)
+                             if buf:
+                                 base_data = pickle.loads(buf)
+                             else:
+                                 base_data = torch.load(base_pt_full_path, weights_only=False)
+                    else:
+                        base_data = torch.load(base_pt_full_path, weights_only=False)
+                        
                     base_verts_np = base_data['base_verts'].numpy().astype(np.float32)
                     base_faces_np = base_data['base_faces'].numpy().astype(np.int64)
                     
@@ -220,21 +336,21 @@ class ScanToMeshDataset(Dataset):
             
             # print(f"[Dataset Worker] Idx {idx}: Total {t3-t0:.4f}s | Load {t1-t0:.4f}s | Sample {t2-t1:.4f}s | Simplify ({self.backend}) {t3-t2:.4f}s")
         
-        # Debug Export (First item only)
-        if self.debug_export and idx == 0:
-            os.makedirs("debug_dataset", exist_ok=True)
-            # For saving, reuse Open3D
-            dbg_mesh = o3d.geometry.TriangleMesh()
-            dbg_mesh.vertices = o3d.utility.Vector3dVector(base_verts_np)
-            dbg_mesh.triangles = o3d.utility.Vector3iVector(base_faces_np.astype(np.int32))
-            o3d.io.write_triangle_mesh("debug_dataset/base_mesh_debug.obj", dbg_mesh)
+        # # Debug Export (First item only)
+        # if self.debug_export and idx == 0:
+        #     os.makedirs("debug_dataset", exist_ok=True)
+        #     # For saving, reuse Open3D
+        #     dbg_mesh = o3d.geometry.TriangleMesh()
+        #     dbg_mesh.vertices = o3d.utility.Vector3dVector(base_verts_np)
+        #     dbg_mesh.triangles = o3d.utility.Vector3iVector(base_faces_np.astype(np.int32))
+        #     o3d.io.write_triangle_mesh("debug_dataset/base_mesh_debug.obj", dbg_mesh)
             
-            pc = o3d.geometry.PointCloud()
-            pc.points = o3d.utility.Vector3dVector(scan_points)
-            o3d.io.write_point_cloud("debug_dataset/scan_points_debug.ply", pc)
-            print(f"[Dataset Debug] Exported base mesh (V={len(base_verts_np)}, F={len(base_faces_np)}) and scan points.")
+        #     pc = o3d.geometry.PointCloud()
+        #     pc.points = o3d.utility.Vector3dVector(scan_points)
+        #     o3d.io.write_point_cloud("debug_dataset/scan_points_debug.ply", pc)
+        #     print(f"[Dataset Debug] Exported base mesh (V={len(base_verts_np)}, F={len(base_faces_np)}) and scan points.")
         
-        return {
+        result = {
             'scan_points': torch.from_numpy(scan_points), # (P, 3)
             'base_verts': torch.from_numpy(base_verts_np), # (V, 3)
             'base_faces': torch.from_numpy(base_faces_np), # (F, 3)
@@ -242,6 +358,9 @@ class ScanToMeshDataset(Dataset):
             'gt_verts': torch.from_numpy(gt_verts_np), # Need to return normalized GT!
             'gt_faces': data['gt_faces'] # Faces unchanged
         }
+        if self.use_scan_normal and scan_normals is not None:
+            result['scan_normals'] = torch.from_numpy(scan_normals)  # (P, 3)
+        return result
 
 def stage2_collate_fn(batch):
     """
@@ -250,6 +369,8 @@ def stage2_collate_fn(batch):
     Meshes are kept as lists (or could be packed Meshes).
     """
     scan_points = torch.stack([item['scan_points'] for item in batch])
+    has_scan_normal = ('scan_normals' in batch[0])
+    scan_normals = torch.stack([item['scan_normals'] for item in batch]) if has_scan_normal else None
     
     base_verts_list = [item['base_verts'] for item in batch]
     base_faces_list = [item['base_faces'] for item in batch]
@@ -258,7 +379,7 @@ def stage2_collate_fn(batch):
     gt_verts_list = [item['gt_verts'] for item in batch]
     gt_faces_list = [item['gt_faces'] for item in batch]
     
-    return {
+    result = {
         'scan_points': scan_points,
         'base_verts': base_verts_list,
         'base_faces': base_faces_list,
@@ -266,3 +387,6 @@ def stage2_collate_fn(batch):
         'gt_verts': gt_verts_list,
         'gt_faces': gt_faces_list
     }
+    if has_scan_normal:
+        result['scan_normals'] = scan_normals
+    return result

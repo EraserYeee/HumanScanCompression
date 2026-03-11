@@ -1,0 +1,52 @@
+data:
+  dataset_type: thingi10k  # 'human' (default) or 'thingi10k'
+  base_mesh_faces_max: 3000
+  base_mesh_faces_min: 1000
+  batch_size: 4
+  data_root: /mnt/lab/data/yeruisi/data/compression/thingi10k
+  lmdb_path: null
+  num_workers: 2
+  point_num: 1280000
+  preload_ram: false
+  preprocessed_base_mesh_dir: /mnt/lab/data/yeruisi/data/compression/thingi10k/base_meshes
+  processed_dir: /mnt/lab/data/yeruisi/data/compression/thingi10k/processed
+  simplification_backend: pyfqmr
+  use_preprocess_base_mesh: true
+device: cuda
+experiment_name: stage2_baseline_sumoffeature_mode2_n
+loss:
+  use_chamfer: false
+  w_chamfer: 100.0
+  w_disp: 0.0
+  w_laplacian: 0.0
+  w_mat: 0.001
+  w_render: 1.0
+  # Multi-component render loss weights
+  w_depth_l1: 10.0      # L1 loss for depth maps
+  w_normal_l1: 4.0      # L1 loss for normal maps
+  w_normal_ssim: 0.5    # SSIM loss for normal maps only
+  w_normal_lpips: 0.5   # LPIPS loss for normal maps only
+model:
+  dec_hidden_dim: 256
+  decoder_type: sum_of_feature
+  enc_hidden_dim: 256
+  feature_dim: 512
+  posenc_mode: 2
+  predict_offset: false
+  subdivision_levels: 6
+  subdivision_rate: 6
+  use_feature_transform: false
+  use_scan_normal: true
+  init_mode: random  # 'near_zero' or 'random' initialization
+render:
+  dist_multiplier: 1.2
+  image_size: 512
+  use_mixed_views: false
+  views_per_sample: 3
+seed: 42
+train:
+  epochs: 500
+  log_interval: 10
+  lr: 5.0e-05
+  save_interval: 3
+  weight_decay: 1.0e-05
