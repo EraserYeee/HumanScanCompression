@@ -184,11 +184,18 @@ def train(config, args):
     # No need for .to(device), accelerate handles it
     
     # 4. Setup Renderer (Loss)
-    # Renderer needs correct device for camera generation
+    # View chunking: split total views into smaller chunks to save VRAM
+    total_views_per_sample = config['render']['views_per_sample']
+    view_chunk_size = config['render'].get('view_chunk_size', total_views_per_sample)
+    num_view_chunks = max(1, total_views_per_sample // view_chunk_size)
+    if accelerator.is_main_process:
+        print(f"Rendering: {total_views_per_sample} views/sample, "
+              f"chunk_size={view_chunk_size}, num_chunks={num_view_chunks}")
+    
     renderer = DifferentiableNormalRenderer(
         image_size=config['render']['image_size'], 
         device=accelerator.device, 
-        cameras_per_batch=config['render']['views_per_sample'],
+        cameras_per_batch=view_chunk_size,
         dist_multiplier=config['render'].get('dist_multiplier', 1.0)
     )
     
@@ -224,6 +231,10 @@ def train(config, args):
     # Resume from checkpoint if specified
     start_epoch = 0
     resume_path = config.get('resume_path', None)
+    resume_use_config_lr = bool(
+        config.get('train', {}).get('resume_use_config_lr', False) or
+        getattr(args, 'resume_use_config_lr', False)
+    )
     if resume_path and os.path.exists(resume_path):
         if accelerator.is_main_process:
             print(f"Resuming training from {resume_path}...")
@@ -240,6 +251,20 @@ def train(config, args):
         # Load optimizer and scheduler
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        # Optional: ignore resumed LR and force config LR after loading states
+        if resume_use_config_lr:
+            target_lr = float(config['train']['lr'])
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = target_lr
+                if 'initial_lr' in param_group:
+                    param_group['initial_lr'] = target_lr
+            if hasattr(scheduler, 'base_lrs'):
+                scheduler.base_lrs = [target_lr for _ in scheduler.base_lrs]
+            if hasattr(scheduler, '_last_lr'):
+                scheduler._last_lr = [target_lr for _ in scheduler._last_lr]
+            if accelerator.is_main_process:
+                print(f"Resume LR override enabled: using config lr = {target_lr}")
         
         start_epoch = checkpoint['epoch'] + 1
         if accelerator.is_main_process:
@@ -373,123 +398,22 @@ def train(config, args):
                 
                 # Check if using Chamfer Loss
                 loss_chamfer = torch.tensor(0.0, device=accelerator.device)
-                loss_render = torch.tensor(0.0, device=accelerator.device)
                 
                 use_chamfer = config['loss'].get('use_chamfer', False)
                 
                 if use_chamfer:
-                    # Chamfer Distance: f_verts vs b_scan
-                    # chamfer_distance returns (loss, loss_normals) or (dist1, dist2)
-                    # For pytorch3d, it returns (dist1, dist2) which are squared distances
-                    # We need to mean them
                     chamfer_result = chamfer_distance(f_verts, b_scan)
                     loss_chamfer = chamfer_result[0]
-                    # Release the second return value if it exists (may hold computation graph)
                     if len(chamfer_result) > 1:
                         del chamfer_result[1]
                     del chamfer_result
                 
-                # 1. Render Loss
-                # Render Pred vs GT
-                # f_faces is (F_fine, 3), need (1, F_fine, 3)
                 f_faces_expanded = f_faces.unsqueeze(0)
                 
-                # Initialize render loss components
-                loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
-                loss_normal_l1 = torch.tensor(0.0, device=accelerator.device)
-                loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
-                loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
-                pred_img = None
-                gt_img = None
-                pred_depth = None
-                gt_depth = None
-                
-                if not use_chamfer or config['loss']['w_render'] > 0:
-                    pred_img, gt_img, pred_depth, gt_depth = renderer(f_verts, f_faces_expanded, g_verts, g_faces)
-                    
-                    # Get loss weights from config (defaults: depth_l1=10, normal_l1=4, ssim=0.5, lpips=0.5)
-                    w_depth_l1 = config['loss'].get('w_depth_l1', 10.0)
-                    w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
-                    w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
-                    w_normal_lpips = config['loss'].get('w_normal_lpips', 0.5)
-                    
-                    # 1. Depth L1 Loss
-                    if w_depth_l1 > 0 and pred_depth is not None and gt_depth is not None:
-                        # Only compute on valid pixels (mask > 0)
-                        depth_mask = (pred_depth.abs() > 1e-6) & (gt_depth.abs() > 1e-6)
-                        if depth_mask.any():
-                            loss_depth_l1 = torch.nn.functional.l1_loss(
-                                pred_depth[depth_mask], gt_depth[depth_mask]
-                            )
-                    
-                    # 2. Normal L1 Loss
-                    if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
-                        # Mask: valid pixels (non-zero in either pred or gt)
-                        normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
-                                     (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
-                        if normal_mask.any():
-                            # Apply mask and compute L1 loss
-                            pred_masked = pred_img * normal_mask
-                            gt_masked = gt_img * normal_mask
-                            loss_normal_l1 = torch.nn.functional.l1_loss(pred_masked, gt_masked)
-                    
-                    # 3. Normal SSIM Loss (only on normal maps)
-                    if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
-                        # SSIM expects input in [0, 1] range and (B, C, H, W) format
-                        # Normalize from [-1, 1] to [0, 1]
-                        pred_normal_norm = (pred_img + 1.0) * 0.5  # (BK, H, W, 3)
-                        gt_normal_norm = (gt_img + 1.0) * 0.5
-                        
-                        # Permute to (BK, 3, H, W)
-                        pred_normal_norm = pred_normal_norm.permute(0, 3, 1, 2)
-                        gt_normal_norm = gt_normal_norm.permute(0, 3, 1, 2)
-                        
-                        # Compute SSIM (returns similarity, so loss = 1 - ssim)
-                        ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
-                        loss_normal_ssim = 1.0 - ssim_val
-                    
-                    # 4. Normal LPIPS Loss (only on normal maps)
-                    if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
-                        # LPIPS expects input in [-1, 1] range and (B, C, H, W) format
-                        # Our normal maps are already in [-1, 1] range
-                        # Permute to (BK, 3, H, W)
-                        pred_normal_lpips = pred_img.permute(0, 3, 1, 2)
-                        gt_normal_lpips = gt_img.permute(0, 3, 1, 2)
-                        
-                        # Compute LPIPS (no need for no_grad, LPIPS model is frozen)
-                        loss_normal_lpips = lpips_model(pred_normal_lpips, gt_normal_lpips).mean()
-                    
-                    # Combined render loss
-                    loss_render = (
-                        w_depth_l1 * loss_depth_l1 +
-                        w_normal_l1 * loss_normal_l1 +
-                        w_normal_ssim * loss_normal_ssim +
-                        w_normal_lpips * loss_normal_lpips
-                    )
-                    
-                    # Debug Export Images (Every 10 steps)
-                    if should_export and accelerator.is_main_process:
-                        debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
-                else:
-                    # Skip rendering if only chamfer used (save time)
-                    pass
-
-                
-                # 2. Laplacian
-                # f_mesh = Meshes(verts=f_verts, faces=f_faces_expanded)
-                # loss_lap = mesh_laplacian_smoothing(f_mesh)
+                # Non-render losses (computed once, shared across view chunks)
                 loss_lap = torch.tensor(0.0, device=accelerator.device)
-                
-                # 3. Disp Reg
-                # loss_disp = torch.mean(disp ** 2)
                 loss_disp = torch.tensor(0.0, device=accelerator.device)
-                
-                # 4. Feature Transform Regularization
                 loss_mat = torch.tensor(0.0, device=accelerator.device)
-                # if trans_feat is not None:
-                #     loss_mat = feature_transform_regularizer(trans_feat)
-                
-                # 5. VAE KL Divergence Loss
                 loss_kl = torch.tensor(0.0, device=accelerator.device)
                 if model_kl_loss is not None:
                     vae_beta = config['loss'].get('vae_beta', 0.001)
@@ -500,81 +424,107 @@ def train(config, args):
                         beta = vae_beta
                     loss_kl = beta * model_kl_loss
                 
-                # Weighted Sum
-                # w_mat: usually small, e.g. 0.001
                 w_mat = config['loss'].get('w_mat', 0.001)
-                
-                # Dynamic Weighting logic
-                if use_chamfer: 
+                if use_chamfer:
                     w_chamfer = config['loss']['w_chamfer']
-                    w_render=0.0
+                    w_render_weight = 0.0
                 else:
                     w_chamfer = 0.0
-                    w_render=config['loss']['w_render']
-                # If chamfer is ON, we might want to disable render loss or keep it
-                # For debugging "can it move?", we usually rely purely on chamfer first.
-                # Assuming if use_chamfer is True, user wants it to dominate or be the only loss unless specified otherwise.
-                # Let's keep w_render active if it's in config, user can set it to 0.0 in config if they want pure chamfer.
+                    w_render_weight = config['loss']['w_render']
                 
-                loss = (
-                    w_render * loss_render +
+                loss_non_render = (
                     w_chamfer * loss_chamfer +
                     config['loss']['w_laplacian'] * loss_lap +
-                    config['loss']['w_disp'] * loss_disp + 
+                    config['loss']['w_disp'] * loss_disp +
                     w_mat * loss_mat +
                     loss_kl
                 )
                 
-                # Accumulate (average later)
-                loss = loss / len(base_verts_list)
+                # View-chunked rendering with per-chunk backward to save VRAM.
+                # Each chunk renders view_chunk_size views, computes render loss,
+                # and calls backward (with retain_graph for non-last chunks).
+                # This frees rendering intermediates between chunks while
+                # accumulating gradients on model parameters.
+                should_render = not use_chamfer or w_render_weight > 0
+                loss_render_accum = 0.0
                 
-                # Use accelerator for backward
-                accelerator.backward(loss)
-                
-                # --- Gradient & Feature Check (Debug) ---
-                #     # Check Feature Embedding Statistics
-                #     if vertex_features is not None:
-                #          # vertex_features: (B, V, D)
-                #          # Calculate variance/std across vertices (dim=1)
-                #          feat_std = vertex_features.std(dim=1).mean().item()
-                #          feat_mean = vertex_features.mean().item()
-                #          feat_max = vertex_features.max().item()
-                #          feat_min = vertex_features.min().item()
-                #          print(f"\n[Debug] Step {step}: Feature Std={feat_std:.6f}, Mean={feat_mean:.6f}, Max={feat_max:.6f}, Min={feat_min:.6f}")
-                #          if feat_std < 1e-4:
-                #              print(f"[Warning] Feature collapse detected! Std is extremely small.")
-
-                #     # Check Displacement Output
-                #     if disp is not None:
-                #          # disp: (B, V_fine, 1 or 3)
-                #          disp_mean = disp.abs().mean().item()
-                #          disp_max = disp.abs().max().item()
-                #          print(f"[Debug] Step {step}: Displacement Abs Mean={disp_mean:.8f}, Max={disp_max:.8f}")
-
-                #     # Check Decoder output layer (Displacement predictor)
-                #     dec_grad_norm = 0.0
-                #     if hasattr(model, 'module'): # Handle DDP wrapping
-                #         dec_layer = model.module.decoder.mlp[-1]
-                #         enc_first = model.module.encoder.conv1[0]
-                #     else:
-                #         dec_layer = model.decoder.mlp[-1]
-                #         enc_first = model.encoder.conv1[0]
+                if should_render and num_view_chunks > 0:
+                    w_depth_l1 = config['loss'].get('w_depth_l1', 10.0)
+                    w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
+                    w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
+                    w_normal_lpips = config['loss'].get('w_normal_lpips', 0.5)
+                    
+                    for vc in range(num_view_chunks):
+                        is_last_chunk = (vc == num_view_chunks - 1)
                         
-                #     if dec_layer.weight.grad is not None:
-                #         dec_grad_norm = dec_layer.weight.grad.norm().item()
-                #         dec_weight_norm = dec_layer.weight.norm().item()
-                #         print(f"[Debug] Step {step}: Decoder Last Layer Grad Norm={dec_grad_norm:.8f} | Weight Norm={dec_weight_norm:.8f}")
-                #         if dec_grad_norm < 1e-6:
-                #             print(f"[Warning] Decoder gradient is extremely small!")
-
-                #     # Check Encoder first layer (to see if grad flows back)
-                #     if enc_first.weight.grad is not None:
-                #          enc_grad_norm = enc_first.weight.grad.norm().item()
-                #          print(f"[Debug] Step {step}: Encoder First Layer Grad Norm={enc_grad_norm:.8f}")
-                # # ----------------------
+                        pred_img, gt_img, pred_depth, gt_depth = renderer(
+                            f_verts, f_faces_expanded, g_verts, g_faces
+                        )
+                        
+                        loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
+                        loss_normal_l1 = torch.tensor(0.0, device=accelerator.device)
+                        loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
+                        loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
+                        
+                        if w_depth_l1 > 0 and pred_depth is not None and gt_depth is not None:
+                            depth_mask = (pred_depth.abs() > 1e-6) & (gt_depth.abs() > 1e-6)
+                            if depth_mask.any():
+                                loss_depth_l1 = torch.nn.functional.l1_loss(
+                                    pred_depth[depth_mask], gt_depth[depth_mask]
+                                )
+                        
+                        if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
+                            normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
+                                         (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
+                            if normal_mask.any():
+                                pred_masked = pred_img * normal_mask
+                                gt_masked = gt_img * normal_mask
+                                loss_normal_l1 = torch.nn.functional.l1_loss(pred_masked, gt_masked)
+                        
+                        if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
+                            pred_normal_norm = (pred_img + 1.0) * 0.5
+                            gt_normal_norm = (gt_img + 1.0) * 0.5
+                            pred_normal_norm = pred_normal_norm.permute(0, 3, 1, 2)
+                            gt_normal_norm = gt_normal_norm.permute(0, 3, 1, 2)
+                            ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
+                            loss_normal_ssim = 1.0 - ssim_val
+                        
+                        if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
+                            pred_normal_lpips_in = pred_img.permute(0, 3, 1, 2)
+                            gt_normal_lpips_in = gt_img.permute(0, 3, 1, 2)
+                            loss_normal_lpips = lpips_model(pred_normal_lpips_in, gt_normal_lpips_in).mean()
+                        
+                        chunk_render_loss = (
+                            w_depth_l1 * loss_depth_l1 +
+                            w_normal_l1 * loss_normal_l1 +
+                            w_normal_ssim * loss_normal_ssim +
+                            w_normal_lpips * loss_normal_lpips
+                        )
+                        
+                        loss_render_accum += chunk_render_loss.item()
+                        
+                        # Render loss for this chunk, averaged over total chunks
+                        chunk_loss = w_render_weight * chunk_render_loss / num_view_chunks
+                        if is_last_chunk:
+                            chunk_loss = chunk_loss + loss_non_render
+                        chunk_loss = chunk_loss / len(base_verts_list)
+                        
+                        accelerator.backward(chunk_loss, retain_graph=not is_last_chunk)
+                        
+                        if vc == 0 and should_export and accelerator.is_main_process:
+                            debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
+                        
+                        del pred_img, gt_img, pred_depth, gt_depth
+                        del chunk_render_loss, chunk_loss
+                        del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
+                else:
+                    loss_nr_scaled = loss_non_render / len(base_verts_list)
+                    accelerator.backward(loss_nr_scaled)
+                    del loss_nr_scaled
                 
-                total_loss_batch += loss.item()
-                loss_render_batch += loss_render.item()
+                loss_render_avg = loss_render_accum / max(num_view_chunks, 1)
+                total_loss_batch += (w_render_weight * loss_render_avg + loss_non_render.item()) / len(base_verts_list)
+                loss_render_batch += loss_render_avg
                 loss_chamfer_batch += loss_chamfer.item()
                 loss_lap_batch += loss_lap.item()
                 loss_disp_batch += loss_disp.item()
@@ -589,18 +539,9 @@ def train(config, args):
                 del g_verts, g_faces
                 if b_scan_normals is not None:
                     del b_scan_normals
-                if pred_img is not None:
-                    del pred_img
-                if gt_img is not None:
-                    del gt_img
-                if pred_depth is not None:
-                    del pred_depth
-                if gt_depth is not None:
-                    del gt_depth
                 if f_faces_expanded is not None:
                     del f_faces_expanded
-                del loss_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl, loss
-                del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
+                del loss_non_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl
             
             # t_forward_backward = time.time()
 
@@ -771,6 +712,8 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, default='configs/default.yaml', help="Path to config file")
     parser.add_argument('--no_wandb', action='store_true', help="Disable wandb logging")
     parser.add_argument('--resume', type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument('--resume_use_config_lr', action='store_true',
+                        help="When resuming, ignore checkpoint LR and use config['train']['lr']")
     args = parser.parse_args()
     
     config = load_config(args.config)

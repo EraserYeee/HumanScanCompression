@@ -56,53 +56,49 @@ class SumOfFeatureDecoder(nn.Module):
         self.init_mode = init_mode
         self.subdivision = BarycentricSubdivision()
         
-        # --- MLP F (Feature Mapper) ---
-        # Input: Feature + PosEnc(DeltaP)
-        # Note: DeltaP is 3D vector
-        input_dim_F = feature_dim
-        
-        # Add PosEnc(local_pos) to MLP F input
-        if self.posenc_mode == 0:
-             input_dim_F += 3 # Just local_pos (3)
+        # Normalize hidden_dim: single int -> [int, int] for backward compat
+        # (original MLP has 2 hidden layers of equal width)
+        if isinstance(hidden_dim, int):
+            hidden_dims = [hidden_dim, hidden_dim]
         else:
-             input_dim_F += 3 * 2 * levels # PosEnc(local_pos)
-             
-        self.mlp_feature_map = nn.Sequential(
-            nn.Linear(input_dim_F, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU()
-        )
+            hidden_dims = list(hidden_dim)
+        
+        # --- MLP F (Feature Mapper) ---
+        input_dim_F = feature_dim
+        if self.posenc_mode == 0:
+            input_dim_F += 3
+        else:
+            input_dim_F += 3 * 2 * levels
+        
+        layers_f = []
+        dims_f = [input_dim_F] + hidden_dims
+        for i in range(len(hidden_dims)):
+            layers_f.extend([nn.Linear(dims_f[i], dims_f[i + 1]), nn.LeakyReLU()])
+        self.mlp_feature_map = nn.Sequential(*layers_f)
         
         # --- MLP G (Predictor) ---
-        # Input: HiddenDim + [PosEnc(Normal)]
-        input_dim_G = hidden_dim
-        
-        # Add Normal info to MLP G input (only if not predicting global offset)
+        input_dim_G = hidden_dims[-1]
         if not self.predict_offset:
             if self.posenc_mode == 2:
-                input_dim_G += 3 * 2 * levels # PosEnc(normal)
+                input_dim_G += 3 * 2 * levels
             else:
-                input_dim_G += 3 # Just normal (3) (Mode 0 or 1)
+                input_dim_G += 3
         
-        # Output Dim
         out_dim = 3 if self.predict_offset else 1
         
-        self.mlp_predictor = nn.Sequential(
-            nn.Linear(input_dim_G, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, out_dim)
-        )
+        layers_g = []
+        dims_g = [input_dim_G] + hidden_dims + [out_dim]
+        for i in range(len(dims_g) - 1):
+            layers_g.append(nn.Linear(dims_g[i], dims_g[i + 1]))
+            if i < len(dims_g) - 2:
+                layers_g.append(nn.LeakyReLU())
+        self.mlp_predictor = nn.Sequential(*layers_g)
 
-        # Initialize the last layer based on init_mode
         if self.init_mode == 'near_zero':
             nn.init.uniform_(self.mlp_predictor[-1].weight, -1e-5, 1e-5)
             nn.init.constant_(self.mlp_predictor[-1].bias, 0)
         elif self.init_mode == 'random':
-            # Use PyTorch default initialization (Kaiming/He for LeakyReLU)
-            pass  # Already initialized by default
+            pass
         else:
             raise ValueError(f"Unknown init_mode: {self.init_mode}. Must be 'near_zero' or 'random'")
 

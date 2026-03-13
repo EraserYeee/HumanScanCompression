@@ -8,18 +8,21 @@ class LocalFeatureEncoder(nn.Module):
     负责从分组后的局部点云中提取 Base Mesh 顶点的特征向量。
     
     Updated: Integrated ScatterSTNkd (Feature Transform) and ScatterSTN3d (Input Transform)
+    
+    hidden_dim: int 或 list[int]。int 等价于 [int]，list 表示多层隐藏层宽度。
     """
     def __init__(self, input_dim=3, hidden_dim=64, output_dim=128, use_feature_transform=True):
         super().__init__()
         self.output_dim = output_dim
         self.use_feature_transform = use_feature_transform
         
+        hidden_dims = [hidden_dim] if isinstance(hidden_dim, int) else list(hidden_dim)
+        
         # 0. Input Transform (STN3d)
         if self.use_feature_transform:
             self.istn = ScatterSTN3d()
         
         # 1. First Layer (Input -> 64)
-        # PointNet: 64 dim before T-Net
         self.conv1 = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.BatchNorm1d(64),
@@ -30,19 +33,24 @@ class LocalFeatureEncoder(nn.Module):
         if self.use_feature_transform:
             self.fstn = ScatterSTNkd(k=64)
             
-        # 3. Subsequent Layers
-        # 64 -> hidden(usually 128) -> output(usually 1024 in PointNet, but here we keep it smaller e.g. 128)
+        # 3. Subsequent Layers: 64 -> hidden_dims[0] -> ... -> hidden_dims[-1] -> output_dim
         self.conv2 = nn.Sequential(
-            nn.Linear(64, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.Linear(64, hidden_dims[0]),
+            nn.BatchNorm1d(hidden_dims[0]),
             nn.ReLU()
         )
         
+        self.conv_extra = nn.ModuleList()
+        for i in range(1, len(hidden_dims)):
+            self.conv_extra.append(nn.Sequential(
+                nn.Linear(hidden_dims[i - 1], hidden_dims[i]),
+                nn.BatchNorm1d(hidden_dims[i]),
+                nn.ReLU()
+            ))
+        
         self.conv3 = nn.Sequential(
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dims[-1], output_dim),
             nn.BatchNorm1d(output_dim)
-            # No ReLU here usually if it's the final feature before pooling? 
-            # Original PointNet uses ReLU before MaxPool. Let's add it.
         )
         self.relu = nn.ReLU()
 
@@ -87,9 +95,11 @@ class LocalFeatureEncoder(nn.Module):
         if self.use_feature_transform:
             x, trans_feat = self.fstn(x, global_cluster_idx, total_clusters)
             
-        # 3. Layer 2 & 3
-        x = self.conv2(x) # (B*P, hidden)
-        point_feats = self.conv3(x) # (B*P, output)
+        # 3. Layer 2 & extra & 3
+        x = self.conv2(x)
+        for extra_layer in self.conv_extra:
+            x = extra_layer(x)
+        point_feats = self.conv3(x)
         
         # 4. Scatter Max Pooling
         # aggregated_feats: (B*V, output)
@@ -132,6 +142,8 @@ class AttentiveLocalFeatureEncoder(nn.Module):
     替代原始 LocalFeatureEncoder 中的 Max Pooling。
     
     可选: 同时保留 Max Pooling 作为互补信号 (use_max_pool_residual=True)。
+    
+    hidden_dim: int 或 list[int]。int 等价于 [int]，list 表示多层隐藏层宽度。
     """
     def __init__(self, input_dim=3, hidden_dim=64, output_dim=128, 
                  num_attention_heads=4, use_max_pool_residual=True, 
@@ -142,9 +154,11 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         self.num_heads = num_attention_heads
         self.use_max_pool_residual = use_max_pool_residual
         self.attention_temperature = attention_temperature
-        self.score_clip_value = score_clip_value  # Clip logits to prevent extreme values
+        self.score_clip_value = score_clip_value
         assert output_dim % num_attention_heads == 0, \
             f"output_dim ({output_dim}) must be divisible by num_attention_heads ({num_attention_heads})"
+        
+        hidden_dims = [hidden_dim] if isinstance(hidden_dim, int) else list(hidden_dim)
         
         # === Backbone (same structure as LocalFeatureEncoder, no T-Net) ===
         self.conv1 = nn.Sequential(
@@ -153,12 +167,19 @@ class AttentiveLocalFeatureEncoder(nn.Module):
             nn.ReLU()
         )
         self.conv2 = nn.Sequential(
-            nn.Linear(64, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.Linear(64, hidden_dims[0]),
+            nn.BatchNorm1d(hidden_dims[0]),
             nn.ReLU()
         )
+        self.conv_extra = nn.ModuleList()
+        for i in range(1, len(hidden_dims)):
+            self.conv_extra.append(nn.Sequential(
+                nn.Linear(hidden_dims[i - 1], hidden_dims[i]),
+                nn.BatchNorm1d(hidden_dims[i]),
+                nn.ReLU()
+            ))
         self.conv3 = nn.Sequential(
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dims[-1], output_dim),
             nn.BatchNorm1d(output_dim)
         )
         self.relu = nn.ReLU()
@@ -214,7 +235,9 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         
         # === Backbone ===
         x = self.conv1(flat_points)    # (B*P, 64)
-        x = self.conv2(x)             # (B*P, hidden_dim)
+        x = self.conv2(x)             # (B*P, hidden_dims[0])
+        for extra_layer in self.conv_extra:
+            x = extra_layer(x)
         point_feats = self.conv3(x)   # (B*P, output_dim)
         point_feats = self.relu(point_feats)
         
@@ -243,10 +266,12 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         # 4. Weighted aggregation per head
         alpha_exp = alpha.unsqueeze(-1)          # (B*P, H, 1)
         weighted = (alpha_exp * values_mh).view(-1, self.output_dim)  # (B*P, output_dim)
+        # Keep scatter_add operands in the same dtype under AMP/bf16.
+        weighted = weighted.to(point_feats.dtype)
         
         # Scatter sum (using PyTorch built-in for reliability)
-        attn_feats = torch.zeros(total_clusters, self.output_dim, 
-                                 device=flat_points.device, dtype=flat_points.dtype)
+        attn_feats = torch.zeros(total_clusters, self.output_dim,
+                                 device=flat_points.device, dtype=weighted.dtype)
         attn_feats.scatter_add_(0, 
             global_cluster_idx.unsqueeze(-1).expand(-1, self.output_dim), 
             weighted)
@@ -255,6 +280,7 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         if self.use_max_pool_residual:
             max_feats, _ = scatter_max(point_feats, global_cluster_idx, 
                                        dim=0, dim_size=total_clusters)
+            max_feats = max_feats.to(attn_feats.dtype)
             combined = torch.cat([attn_feats, max_feats], dim=-1)  # (B*V, 2*output_dim)
             aggregated_feats = self.projection(combined)           # (B*V, output_dim)
         else:

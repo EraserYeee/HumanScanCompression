@@ -97,7 +97,8 @@ class NeuralSubdivisionDecoder(nn.Module):
         """
         Args:
             feature_dim: 输入特征维度
-            hidden_dim: MLP 隐藏层维度
+            hidden_dim: MLP 隐藏层维度 (int 或 list[int])。
+                        int 等价于 [int, int]（与原始 2 层 MLP 兼容）。
             levels: Positional Encoding 的层数 (fflevels)
             rate: 细分等级 (edge subdivision rate)
             predict_offset: If True, predict 3D offset (xyz) instead of scalar displacement
@@ -112,56 +113,46 @@ class NeuralSubdivisionDecoder(nn.Module):
         self.init_mode = init_mode
         self.subdivision = BarycentricSubdivision()
         
-        # MLP Input Dim calculation
-        # Base input dim: feature_dim
-        dim = feature_dim
-        
-        # Add PosEnc(local_pos)
-        if self.posenc_mode == 0:
-             dim += 3 # Just local_pos (3)
+        # Normalize hidden_dim: single int -> [int, int] for backward compat
+        if isinstance(hidden_dim, int):
+            hidden_dims = [hidden_dim, hidden_dim]
         else:
-             dim += 3 * 2 * levels # PosEnc(local_pos)
-             
-        # Add Normal (only if predict_offset is False)
+            hidden_dims = list(hidden_dim)
+        
+        # MLP Input Dim calculation
+        dim = feature_dim
+        if self.posenc_mode == 0:
+            dim += 3
+        else:
+            dim += 3 * 2 * levels
         if not self.predict_offset:
             if self.posenc_mode == 2:
-                dim += 3 * 2 * levels # PosEnc(normal)
+                dim += 3 * 2 * levels
             else:
-                dim += 3 # Just normal (3)
-                
+                dim += 3
         self.input_dim = dim
         
-        # MLP Output Dim: 1 for scalar displacement (along normal), 3 for vector offset (xyz)
         out_dim = 3 if self.predict_offset else 1
         
-        # Split MLP into Pre-Pooling and Post-Pooling parts for Max-Pooling Aggregation
+        # Pre-MLP: input_dim -> hidden_dims[0] -> ... -> hidden_dims[-1]
+        layers_pre = []
+        dims_pre = [self.input_dim] + hidden_dims
+        for i in range(len(hidden_dims)):
+            layers_pre.extend([nn.Linear(dims_pre[i], dims_pre[i + 1]), nn.LeakyReLU()])
+        self.mlp_pre = nn.Sequential(*layers_pre)
         
-        # Pre-MLP: Processes each vertex branch independently
-        # Input: Feature + PosEnc(LocalPos)
-        # Output: Hidden Feature
-        self.mlp_pre = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU()
-        )
-        
-        # Post-MLP: Processes aggregated features
-        # Input: Hidden Feature (from Max Pooling)
-        # Output: Displacement
+        # Post-MLP: hidden_dims[-1] -> hidden_dims[-1] -> out_dim
         self.mlp_post = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dims[-1], hidden_dims[-1]),
             nn.LeakyReLU(),
-            nn.Linear(hidden_dim, out_dim)
+            nn.Linear(hidden_dims[-1], out_dim)
         )
 
-        # Initialize the last layer based on init_mode
         if self.init_mode == 'near_zero':
             nn.init.uniform_(self.mlp_post[-1].weight, -1e-5, 1e-5)
             nn.init.constant_(self.mlp_post[-1].bias, 0)
         elif self.init_mode == 'random':
-            # Use PyTorch default initialization (Kaiming/He for LeakyReLU)
-            pass  # Already initialized by default
+            pass
         else:
             raise ValueError(f"Unknown init_mode: {self.init_mode}. Must be 'near_zero' or 'random'")
 
