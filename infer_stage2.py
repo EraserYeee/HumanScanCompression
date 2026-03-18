@@ -117,7 +117,12 @@ def load_stage2_config(checkpoint_path):
 def main():
     parser = argparse.ArgumentParser(description="Stage 2 Inference Script")
     parser.add_argument('--checkpoint', type=str, required=True, help="Path to Stage 2 checkpoint (.pth)")
-    parser.add_argument('--mode', type=str, choices=['gt_simplified', 'edgerunner'], default='gt_simplified')
+    parser.add_argument(
+        '--mode',
+        type=str,
+        choices=['gt_simplified', 'edgerunner', 'given_simplified'],
+        default='gt_simplified'
+    )
     parser.add_argument('--data_source', type=str, choices=['dataset', 'single'], default='dataset')
     parser.add_argument('--input_path', type=str, help="Path to dataset processed_dir or single obj")
     parser.add_argument('--edgerunner_ckpt', type=str, help="Path to EdgeRunner checkpoint")
@@ -213,12 +218,45 @@ def main():
                         'name': os.path.splitext(os.path.basename(item['pt_path']))[0],
                         'gt_path': os.path.join(data_root, item['pt_path'])
                     })
+        elif args.mode == 'given_simplified':
+            raise ValueError("mode=given_simplified 目前仅支持 data_source=single，请使用 --data_source single")
     else:
-        samples.append({
-            'name': os.path.splitext(os.path.basename(args.input_path))[0],
-            'gt_path': args.input_path,
-            'base_path': None
-        })
+        # 单样本模式
+        if args.mode == 'given_simplified':
+            if not args.input_path:
+                raise ValueError("mode=given_simplified 需要指定 --input_path=gt_step_xxxx.obj")
+            gt_path = os.path.abspath(args.input_path)
+            if not os.path.exists(gt_path):
+                raise FileNotFoundError(f"输入的 gt mesh 不存在: {gt_path}")
+            name = os.path.splitext(os.path.basename(gt_path))[0]
+            # 推断对应的 base mesh 文件名
+            suffix = ""
+            if name.startswith("gt_step_"):
+                suffix = name[len("gt_step_"):]
+            elif name.startswith("gt_"):
+                suffix = name[len("gt_"):]
+            if suffix:
+                base_filename = f"base_step_{suffix}.obj"
+            else:
+                base_filename = name.replace("gt_", "base_", 1) + ".obj" if name.startswith("gt_") else f"base_{name}.obj"
+            base_path = os.path.join(os.path.dirname(gt_path), base_filename)
+            base_path = os.path.abspath(base_path)
+            if not os.path.exists(base_path):
+                raise FileNotFoundError(
+                    f"mode=given_simplified 期望在与 gt 同目录下找到 {os.path.basename(base_path)}，但未找到。"
+                )
+            samples.append({
+                'name': name,
+                'gt_path': gt_path,
+                'base_path': base_path
+            })
+        else:
+            # 原有单样本逻辑：只给一个扫描，基于扫描在线简化 base mesh
+            samples.append({
+                'name': os.path.splitext(os.path.basename(args.input_path))[0],
+                'gt_path': args.input_path,
+                'base_path': None
+            })
 
     renderer = DifferentiableNormalRenderer(
         image_size=config['render']['image_size'],
@@ -262,7 +300,23 @@ def main():
                 base_mesh_o3d = o3d_m.simplify_quadric_decimation(target_number_of_triangles=args.test_num_face)
                 base_v, base_f = np.asarray(base_mesh_o3d.vertices, dtype=np.float32), np.asarray(base_mesh_o3d.triangles, dtype=np.int64)
                 base_usage_info.append({"name": name, "base_path": "simplified_on_the_fly"})
-            
+        elif args.mode == 'given_simplified':
+            base_path = sample.get('base_path', None)
+            if not base_path or not os.path.exists(base_path):
+                raise FileNotFoundError(
+                    f"mode=given_simplified 需要有效的 base_path，但在样本 {name} 中未找到或文件不存在: {base_path}"
+                )
+            # 这里的 base mesh 是已经给定好的简化网格（OBJ 或其他几何格式）
+            if base_path.endswith('.pt'):
+                base_data = torch.load(base_path, map_location='cpu', weights_only=False)
+                base_v = apply_normalization(base_data['base_verts'].numpy().astype(np.float32), center, scale)
+                base_f = base_data['base_faces'].numpy().astype(np.int64)
+            else:
+                base_mesh = trimesh.load(base_path, process=False)
+                base_v_raw, base_f_raw = base_mesh.vertices, base_mesh.faces
+                base_v = apply_normalization(base_v_raw.astype(np.float32), center, scale)
+                base_f = base_f_raw.astype(np.int64)
+            base_usage_info.append({"name": name, "base_path": base_path, "mode": "given_simplified"})
         elif args.mode == 'edgerunner':
             os.makedirs(ER_CACHE_DIR, exist_ok=True)
             c_obj, c_pkl = os.path.join(ER_CACHE_DIR, f"{name}_base.obj"), os.path.join(ER_CACHE_DIR, f"{name}_emb.pkl")
@@ -289,7 +343,18 @@ def main():
         o3d_m.vertices, o3d_m.triangles = o3d.utility.Vector3dVector(base_v), o3d.utility.Vector3iVector(base_f.astype(np.int32))
         o3d_m.compute_vertex_normals()
         base_n = np.asarray(o3d_m.vertex_normals, dtype=np.float32)
-        scan_points, _ = trimesh.sample.sample_surface(trimesh.Trimesh(vertices=gt_v_norm, faces=gt_f, process=False), config['data']['point_num'])
+
+        # 构建 GT mesh 用于采样点和法线
+        gt_mesh_tm = trimesh.Trimesh(vertices=gt_v_norm, faces=gt_f, process=False)
+        scan_points, face_ids = trimesh.sample.sample_surface(
+            gt_mesh_tm, config['data']['point_num']
+        )
+
+        scan_normals_np = None
+        if config['model'].get('use_scan_normal', False):
+            # 使用对应三角形法线作为采样点的法线
+            face_normals = gt_mesh_tm.face_normals  # (F, 3)
+            scan_normals_np = face_normals[face_ids].astype(np.float32)
         
         # Prepare Tensors
         # Ensure float32 for vertex/normal/scan data, and long for faces
@@ -297,9 +362,16 @@ def main():
         b_f = torch.from_numpy(base_f).long().unsqueeze(0).to(device).contiguous()
         b_n = torch.from_numpy(base_n).float().unsqueeze(0).to(device).contiguous()
         b_s = torch.from_numpy(scan_points).float().unsqueeze(0).to(device).contiguous()
+        if scan_normals_np is not None:
+            b_s_n = torch.from_numpy(scan_normals_np).float().unsqueeze(0).to(device).contiguous()
+        else:
+            b_s_n = None
 
         with torch.no_grad():
-            fv, ff, _, _, _, _ = model(b_v, b_f, b_n, b_s)
+            if b_s_n is not None:
+                fv, ff, _, _, _, _ = model(b_v, b_f, b_n, b_s, scan_normals=b_s_n)
+            else:
+                fv, ff, _, _, _, _ = model(b_v, b_f, b_n, b_s)
             
         trimesh.Trimesh(vertices=fv[0].cpu().numpy(), faces=ff.cpu().numpy(), process=False).export(os.path.join(fine_mesh_out_dir, f"{name}_fine.obj"))
 

@@ -6,6 +6,8 @@
 /checkpoints/
 /results/
 /extensions/
+/tempout/
+/output/
 # Python 相关的临时文件或缓存
 __pycache__/
 *.pyc
@@ -24,3 +26,4 @@ nohup.out
 *.jpg
 *.png
 *.log
+*.obj

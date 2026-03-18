@@ -29,10 +29,10 @@ loss:
   vae_beta: 0.001         # KL divergence weight
   vae_warmup_epochs: 0   # linearly ramp beta from 0 to vae_beta over this many epochs
 model:
-  dec_hidden_dim: 256
+  dec_hidden_dim: [128,256, 512]
   decoder_type: sum_of_feature
-  enc_hidden_dim: 256
-  feature_dim: 512
+  enc_hidden_dim: [512, 256, 64]
+  feature_dim: 1024
   posenc_mode: 2
   predict_offset: false
   subdivision_levels: 8
@@ -48,16 +48,17 @@ model:
   score_init_scale: 0.4        # scale factor for score_linear initialization (smaller = more uniform initial attention)
   score_clip_value: 5.0         # scale factor for score_linear initialization (smaller = more uniform initial attention)
   # VAE bottleneck (decoupled, can be toggled independently)
-  use_vae: true
-  vae_latent_dim: 20          # latent dimension when VAE is enabled
+  use_vae: false
+  vae_latent_dim: 40          # latent dimension when VAE is enabled
 render:
   dist_multiplier: 0.5
   image_size: 512
   use_mixed_views: false
-  views_per_sample: 3
+  views_per_sample: 4
+  view_chunk_size: 2
 seed: 42
 # Enable attention mechanism diagnostics (only effective when encoder_type='attentive')
-enable_attention_diagnostics: true  # Set to false to disable diagnostics
+enable_attention_diagnostics: false  # Set to false to disable diagnostics
 train:
   epochs: 500
   log_interval: 10
