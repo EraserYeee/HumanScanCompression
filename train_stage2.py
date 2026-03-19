@@ -210,7 +210,7 @@ def train(config, args):
         assert("no lpips model found")
 
     # 5. Optimizer
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         model.parameters(), 
         lr=float(config['train']['lr']),
         weight_decay=float(config['train']['weight_decay'])

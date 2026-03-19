@@ -173,10 +173,7 @@ def main():
     np.random.seed(args.seed)
 
     os.makedirs(args.base_output_dir, exist_ok=True)
-    print("Sleeping for 40 minutes before starting to process base meshes...")
-    import time
-    time.sleep(30 * 60)
-    print("Woke up! Starting base mesh processing.")
+
 
     def resolve_pt_files_from_index(index_path: str):
         with open(index_path, "r") as f:

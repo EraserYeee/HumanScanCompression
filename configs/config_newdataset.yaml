@@ -1,0 +1,67 @@
+data:
+  base_mesh_faces_max: 3500
+  base_mesh_faces_min: 2000
+  batch_size: 1
+  data_root: /home/ruisi/mesh_compression/data/official
+  lmdb_path: /mnt/lab/data/yeruisi/data/compression/datalmdb/train.lmdb
+  num_workers: 2
+  point_num: 819200
+  preload_ram: false
+  preprocessed_base_mesh_dir: /mnt/lab/data/yeruisi/data/compression/base_mesh_preload2
+  processed_dir: /mnt/lab/data/yeruisi/data/compression/dataset_preload2
+  simplification_backend: pyfqmr
+  use_preprocess_base_mesh: true
+device: cuda
+experiment_name: stage2_baseline_sumoffeature_attentiononly_singlehead
+loss:
+  use_chamfer: false
+  w_chamfer: 100.0
+  w_disp: 0.0
+  w_laplacian: 0.0
+  w_mat: 0.001
+  w_render: 1.0
+  # Multi-component render loss weights
+  w_depth_l1: 10.0      # L1 loss for depth maps
+  w_normal_l1: 4.0      # L1 loss for normal maps
+  w_normal_ssim: 0.5    # SSIM loss for normal maps only
+  w_normal_lpips: 0.5   # LPIPS loss for normal maps only
+  # VAE loss (only active when model.use_vae=true)
+  vae_beta: 0.001         # KL divergence weight
+  vae_warmup_epochs: 0   # linearly ramp beta from 0 to vae_beta over this many epochs
+model:
+  dec_hidden_dim: [128,256, 512]
+  decoder_type: sum_of_feature
+  enc_hidden_dim: [512, 256, 64]
+  feature_dim: 1024
+  posenc_mode: 2
+  predict_offset: false
+  subdivision_levels: 8
+  subdivision_rate: 12
+  use_feature_transform: false
+  use_scan_normal: true
+  init_mode: near_zero  # 'near_zero' or 'random' initialization
+  # Encoder type: 'standard' (original MaxPool PointNet) or 'attentive' (multi-head attention pooling)
+  encoder_type: attentive
+  num_attention_heads: 1       # number of attention heads (only for 'attentive')
+  use_max_pool_residual: false  # combine attention pooling with max pooling (only for 'attentive')
+  attention_temperature: 1.5   # temperature scaling for attention softmax (T>1: smoother, T<1: sharper)
+  score_init_scale: 0.4        # scale factor for score_linear initialization (smaller = more uniform initial attention)
+  score_clip_value: 5.0         # scale factor for score_linear initialization (smaller = more uniform initial attention)
+  # VAE bottleneck (decoupled, can be toggled independently)
+  use_vae: false
+  vae_latent_dim: 40          # latent dimension when VAE is enabled
+render:
+  dist_multiplier: 0.5
+  image_size: 512
+  use_mixed_views: false
+  views_per_sample: 5
+  view_chunk_size: 5
+seed: 42
+# Enable attention mechanism diagnostics (only effective when encoder_type='attentive')
+enable_attention_diagnostics: false  # Set to false to disable diagnostics
+train:
+  epochs: 500
+  log_interval: 10
+  lr: 1.0e-03
+  save_interval: 3
+  weight_decay: 1.0e-05

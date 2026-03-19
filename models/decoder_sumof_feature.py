@@ -25,27 +25,25 @@ def positional_encoding(vector: torch.Tensor, extras: list[torch.Tensor], levels
 
 class SumOfFeatureDecoder(nn.Module):
     """
-    New Decoder Architecture: "Sum of Feature"
+    Decoder Architecture: Barycentric Feature Interpolation
     
     Logic:
-    1. For each of the 3 vertices of a face:
-       - Compute relative position: delta_p_i = p_lin - p_anchor_i
-       - Map feature and geometry to a hidden vector: h_i = MLP_F(feature_i, PosEnc(delta_p_i))
-    2. Sum the hidden vectors: H = sum(h_i)
-    3. Predict displacement from aggregated feature:
-       - d = MLP_G(H, PosEnc(n_lin))  [if predict_scalar]
-       - d = MLP_G(H)                 [if predict_offset, no normal]
-    4. Stitch Seams (New):
-       - Identify shared subdivision points on edges/vertices.
-       - Average the predicted displacements d for these shared points.
+    1. For each subdivision point, interpolate the 3 anchor vertex features
+       using the point's barycentric coordinates as weights:
+       H = w0 * feat_0 + w1 * feat_1 + w2 * feat_2
+    2. Predict displacement from interpolated feature:
+       - d = MLP_G(H, normal)           [if predict_scalar]
+       - d = MLP_G(H)                   [if predict_offset]
+    3. Stitch Seams:
+       - Average predicted displacements for shared subdivision points.
        
     Args:
         feature_dim: Dimension of input vertex features
-        hidden_dim: Dimension of the intermediate hidden vector H
-        levels: Positional Encoding levels
+        hidden_dim: Hidden layer dimensions for MLP_G
+        levels: Positional Encoding levels (for normal in posenc_mode=2)
         rate: Subdivision rate
         predict_offset: If True, predict 3D offset (xyz)
-        posenc_mode: 0=No PE, 1=PE(LocalPos), 2=PE(LocalPos) + PE(Normal)
+        posenc_mode: 0/1=raw normal, 2=PE(Normal)
     """
     def __init__(self, feature_dim=128, hidden_dim=64, levels=8, rate=4, predict_offset=False, posenc_mode=0, init_mode='near_zero'):
         super().__init__()
@@ -62,22 +60,24 @@ class SumOfFeatureDecoder(nn.Module):
             hidden_dims = [hidden_dim, hidden_dim]
         else:
             hidden_dims = list(hidden_dim)
+        #         # --- MLP F (Feature Mapper) ---
+        # input_dim_F = feature_dim
+        # if self.posenc_mode == 0:
+        #     input_dim_F += 3
+        # else:
+        #     input_dim_F += 3 * 2 * levels
         
-        # --- MLP F (Feature Mapper) ---
-        input_dim_F = feature_dim
-        if self.posenc_mode == 0:
-            input_dim_F += 3
-        else:
-            input_dim_F += 3 * 2 * levels
+        # layers_f = []
+        # dims_f = [input_dim_F] + hidden_dims
+        # for i in range(len(hidden_dims)):
+        #     layers_f.extend([nn.Linear(dims_f[i], dims_f[i + 1]), nn.LeakyReLU()])
+        # self.mlp_feature_map = nn.Sequential(*layers_f)
         
-        layers_f = []
-        dims_f = [input_dim_F] + hidden_dims
-        for i in range(len(hidden_dims)):
-            layers_f.extend([nn.Linear(dims_f[i], dims_f[i + 1]), nn.LeakyReLU()])
-        self.mlp_feature_map = nn.Sequential(*layers_f)
-        
+        # input_dim_G = hidden_dims[-1]
         # --- MLP G (Predictor) ---
-        input_dim_G = hidden_dims[-1]
+        # Feature aggregation is now done via barycentric interpolation (no MLP_F),
+        # so MLP_G takes feature_dim directly.
+        input_dim_G = feature_dim
         if not self.predict_offset:
             if self.posenc_mode == 2:
                 input_dim_G += 3 * 2 * levels
@@ -160,59 +160,62 @@ class SumOfFeatureDecoder(nn.Module):
         ln = self.interpolate_barycentric(base_normals, base_faces, uv_A, uv_B)
         ln = F.normalize(ln, dim=-1, p=2)
         
-        # 3. Sum of Features Logic
+        # 3. Barycentric Interpolation of Features
+        # Directly interpolate vertex features using barycentric coordinates:
+        #   uv_A -> vertex 0, uv_B -> vertex 1, (1-uv_A-uv_B) -> vertex 2
+        feat_interp = self.interpolate_barycentric(vertex_features, base_faces, uv_A, uv_B)
+        #         # 3.1 Gather vertex attributes
+        # batch_offset = (torch.arange(B, device=base_verts.device) * V).view(-1, 1, 1)
+        # flat_faces = (base_faces + batch_offset).view(-1)
         
-        # 3.1 Gather vertex attributes
-        batch_offset = (torch.arange(B, device=base_verts.device) * V).view(-1, 1, 1)
-        flat_faces = (base_faces + batch_offset).view(-1)
+        # # Features: (B, F, 3, D)
+        # flat_feats = vertex_features.view(-1, vertex_features.shape[-1])
+        # face_feats = flat_feats[flat_faces].view(B, num_faces, 3, -1)
         
-        # Features: (B, F, 3, D)
-        flat_feats = vertex_features.view(-1, vertex_features.shape[-1])
-        face_feats = flat_feats[flat_faces].view(B, num_faces, 3, -1)
+        # # Vertices: (B, F, 3, 3)
+        # flat_verts = base_verts.view(-1, 3)
+        # face_verts = flat_verts[flat_faces].view(B, num_faces, 3, 3)
         
-        # Vertices: (B, F, 3, 3)
-        flat_verts = base_verts.view(-1, 3)
-        face_verts = flat_verts[flat_faces].view(B, num_faces, 3, 3)
+        # # Reshape lp to (B, F, K, 3)
+        # lp_reshaped = lp.view(B, num_faces, K, 3)
         
-        # Reshape lp to (B, F, K, 3)
+        # # Initialize Aggregated Feature H
+        # # H shape: (B, F, K, hidden_dim)
+        # H_agg = 0
+        
+        # # Loop over 3 vertices to sum mapped features
+        # for i in range(3):
+        #     # Vertex position: (B, F, 1, 3)
+        #     v_pos = face_verts[:, :, i, :].unsqueeze(2)
+            
+        #     # Relative position (Global Relative): (B, F, K, 3)
+        #     delta = lp_reshaped - v_pos
+            
+        #     # Feature: (B, F, K, D)
+        #     feat = face_feats[:, :, i, :].unsqueeze(2).expand(-1, -1, K, -1)
+            
+        #     # Prepare Input for MLP F
+        #     mlp_f_in_list = [feat]
+            
+        #     if self.posenc_mode == 0:
+        #         mlp_f_in_list.append(delta)
+        #     else:
+        #         # Mode 1 or 2: Apply PosEnc to DeltaP
+        #         pe_delta = positional_encoding(delta, [], self.fflevels)
+        #         mlp_f_in_list.append(pe_delta)
+            
+        #     # Concat
+        #     mlp_f_in = torch.cat(mlp_f_in_list, dim=-1) # (B, F, K, InputDim_F)
+            
+        #     # Map Feature
+        #     # Flatten for MLP: (B*F*K, InputDim_F)
+        #     h_i = self.mlp_feature_map(mlp_f_in.view(-1, mlp_f_in.shape[-1]))
+            
+        #     # Reshape back and Accumulate
+        #     h_i = h_i.view(B, num_faces, K, -1)
+        #     H_agg = H_agg + h_i
         K = uv_A.shape[0] // num_faces
-        lp_reshaped = lp.view(B, num_faces, K, 3)
-        
-        # Initialize Aggregated Feature H
-        # H shape: (B, F, K, hidden_dim)
-        H_agg = 0
-        
-        # Loop over 3 vertices to sum mapped features
-        for i in range(3):
-            # Vertex position: (B, F, 1, 3)
-            v_pos = face_verts[:, :, i, :].unsqueeze(2)
-            
-            # Relative position (Global Relative): (B, F, K, 3)
-            delta = lp_reshaped - v_pos
-            
-            # Feature: (B, F, K, D)
-            feat = face_feats[:, :, i, :].unsqueeze(2).expand(-1, -1, K, -1)
-            
-            # Prepare Input for MLP F
-            mlp_f_in_list = [feat]
-            
-            if self.posenc_mode == 0:
-                mlp_f_in_list.append(delta)
-            else:
-                # Mode 1 or 2: Apply PosEnc to DeltaP
-                pe_delta = positional_encoding(delta, [], self.fflevels)
-                mlp_f_in_list.append(pe_delta)
-            
-            # Concat
-            mlp_f_in = torch.cat(mlp_f_in_list, dim=-1) # (B, F, K, InputDim_F)
-            
-            # Map Feature
-            # Flatten for MLP: (B*F*K, InputDim_F)
-            h_i = self.mlp_feature_map(mlp_f_in.view(-1, mlp_f_in.shape[-1]))
-            
-            # Reshape back and Accumulate
-            h_i = h_i.view(B, num_faces, K, -1)
-            H_agg = H_agg + h_i
+        H_agg = feat_interp.view(B, num_faces, K, -1)
             
         # 4. Final Prediction using MLP G
         
@@ -251,13 +254,6 @@ class SumOfFeatureDecoder(nn.Module):
         # Compute averaged displacements
         # disp_flat: (B, N, D)
         # merge_idx: (B, N)
-        # We need to flatten Batch dim for scatter_mean, then reshape back
-        # But compute_merge_indices already handles batch offset internally for "unique values" logic?
-        # WAIT. My compute_merge_indices returns (B, F*K) where indices are LOCAL to each batch item?
-        # Let's check compute_merge_indices implementation:
-        # It calls `torch.unique` on keys offset by batch. So the indices returned by `return_inverse` 
-        # are GLOBAL indices across the whole batch [0, Total_Unique_Across_Batch - 1].
-        # So we can just flatten disp and use flattened merge_idx.
         
         disp_all = disp_flat.view(-1, disp_flat.shape[-1]) # (B*N, D)
         idx_all = merge_idx.view(-1) # (B*N,)
