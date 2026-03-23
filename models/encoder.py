@@ -2,6 +2,20 @@ import torch
 import torch.nn as nn
 from torch_scatter import scatter_max, scatter_softmax
 from .tnet import ScatterSTNkd, ScatterSTN3d
+from .timing_hooks import prof_start, prof_split
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, mult=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * mult),
+            nn.ReLU(),
+            nn.Linear(dim * mult, dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 class LocalFeatureEncoder(nn.Module):
     """
@@ -66,6 +80,8 @@ class LocalFeatureEncoder(nn.Module):
             trans_feat: (B*V, K, K) or None
         """
         B, P, D = local_points.shape
+        do_log = getattr(self, "_profile_do_log", False)
+        t0 = prof_start() if do_log else None
         
         # Flatten for Scatter operations
         # local_points: (B*P, 3)
@@ -100,6 +116,8 @@ class LocalFeatureEncoder(nn.Module):
         for extra_layer in self.conv_extra:
             x = extra_layer(x)
         point_feats = self.conv3(x)
+        if do_log:
+            t0 = prof_split(do_log, t0, "local_backbone", "enc")
         
         # 4. Scatter Max Pooling
         # aggregated_feats: (B*V, output)
@@ -131,6 +149,8 @@ class LocalFeatureEncoder(nn.Module):
         # 5. Reshape back to Batch
         # (B*V, D) -> (B, V, D)
         vertex_features = aggregated_feats.view(B, num_verts, self.output_dim)
+        if do_log:
+            prof_split(do_log, t0, "local_scatter_pool", "enc")
         
         return vertex_features, trans_feat
 
@@ -226,6 +246,8 @@ class AttentiveLocalFeatureEncoder(nn.Module):
             diagnostics: dict or None, 诊断信息
         """
         B, P, D = local_points.shape
+        do_log = getattr(self, "_profile_do_log", False)
+        t0 = prof_start() if do_log else None
         flat_points = local_points.view(-1, D)
         
         # Global cluster indices with batch offset
@@ -240,6 +262,8 @@ class AttentiveLocalFeatureEncoder(nn.Module):
             x = extra_layer(x)
         point_feats = self.conv3(x)   # (B*P, output_dim)
         point_feats = self.relu(point_feats)
+        if do_log:
+            t0 = prof_split(do_log, t0, "attn_backbone", "enc")
         
         # === Multi-Head Attention Pooling ===
         # 1. Compute attention logits
@@ -288,6 +312,8 @@ class AttentiveLocalFeatureEncoder(nn.Module):
         
         # Reshape to batch
         vertex_features = aggregated_feats.view(B, num_verts, self.output_dim)
+        if do_log:
+            prof_split(do_log, t0, "attn_pool_proj", "enc")
         
         # Collect diagnostics if requested
         diagnostics = None
@@ -342,6 +368,153 @@ class AttentiveLocalFeatureEncoder(nn.Module):
                 return vertex_features, None, diagnostics
             else:
                 return vertex_features, None  # None for trans_feat (API compatibility)
+
+
+class CrossAttentionFeatureEncoder(nn.Module):
+    """
+    MaxPool-as-Query Cross-Attention encoder.
+    
+    Two-pass design:
+    1. PointNet backbone → per-point features → MaxPool per cluster → coarse vertex features
+    2. Coarse features as Q, per-point features as K/V → cluster-restricted cross-attention
+    3. Residual: output = coarse (MaxPool) + attention refinement
+    
+    Q and K/V are all in the same PointNet feature space, so Q·K is semantically meaningful:
+    "how relevant is this point's feature to the cluster's dominant feature?"
+    """
+    def __init__(self, input_dim=3, hidden_dim=64, output_dim=128,
+                 num_heads=4, use_ffn=True, **kwargs):
+        super().__init__()
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.use_ffn = use_ffn
+        assert output_dim % num_heads == 0, \
+            f"output_dim ({output_dim}) must be divisible by num_heads ({num_heads})"
+        self.dim_head = output_dim // num_heads
+        self.scale = self.dim_head ** -0.5
+
+        hidden_dims = [hidden_dim] if isinstance(hidden_dim, int) else list(hidden_dim)
+
+        # === PointNet Backbone ===
+        self.conv1 = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU()
+        )
+        self.conv2 = nn.Sequential(
+            nn.Linear(64, hidden_dims[0]),
+            nn.BatchNorm1d(hidden_dims[0]),
+            nn.ReLU()
+        )
+        self.conv_extra = nn.ModuleList()
+        for i in range(1, len(hidden_dims)):
+            self.conv_extra.append(nn.Sequential(
+                nn.Linear(hidden_dims[i - 1], hidden_dims[i]),
+                nn.BatchNorm1d(hidden_dims[i]),
+                nn.ReLU()
+            ))
+        self.conv3 = nn.Sequential(
+            nn.Linear(hidden_dims[-1], output_dim),
+            nn.BatchNorm1d(output_dim),
+            nn.ReLU()
+        )
+
+        # === Cross-Attention projections ===
+        self.norm_q = nn.LayerNorm(output_dim)
+        self.norm_kv = nn.LayerNorm(output_dim)
+        self.to_q = nn.Linear(output_dim, output_dim, bias=False)
+        self.to_k = nn.Linear(output_dim, output_dim, bias=False)
+        self.to_v = nn.Linear(output_dim, output_dim, bias=False)
+        self.to_out = nn.Linear(output_dim, output_dim)
+
+        # === Optional FeedForward ===
+        if use_ffn:
+            self.norm_ffn = nn.LayerNorm(output_dim)
+            self.ffn = FeedForward(output_dim)
+
+    def forward(self, local_points, cluster_idx, num_verts, return_diagnostics=False, **kwargs):
+        """
+        Args:
+            local_points: (B, P, D) per-point local coords (possibly with normals)
+            cluster_idx:  (B, P) vertex assignment per point, values in [0, V-1]
+            num_verts:    int, number of base mesh vertices V
+            return_diagnostics: if True, return a small dict (ca_residual mean vs coarse)
+
+        Returns:
+            vertex_features: (B, V, output_dim)
+            trans_feat: None (API compatibility)
+            diagnostics: optional dict when return_diagnostics=True
+        """
+        B, P, D = local_points.shape
+        V = num_verts
+
+        # Global cluster indices with batch offset
+        batch_offset = (torch.arange(B, device=local_points.device) * V).view(-1, 1)
+        global_cluster_idx = (cluster_idx + batch_offset).view(-1)  # (B*P,)
+        total_clusters = B * V
+
+        # === Pass 1: PointNet Backbone + MaxPool ===
+        x = self.conv1(local_points.view(-1, D))
+        x = self.conv2(x)
+        for extra_layer in self.conv_extra:
+            x = extra_layer(x)
+        point_feats = self.conv3(x)  # (B*P, output_dim)
+
+        vertex_coarse, _ = scatter_max(
+            point_feats, global_cluster_idx, dim=0, dim_size=total_clusters
+        )  # (B*V, output_dim)
+
+        # === Pass 2: Cross-Attention (Q=MaxPool, K/V=point_feats) ===
+        H, D_h = self.num_heads, self.dim_head
+
+        q = self.to_q(self.norm_q(vertex_coarse)).view(-1, H, D_h)   # (B*V, H, D_h)
+
+        kv_normed = self.norm_kv(point_feats)
+        k = self.to_k(kv_normed).view(-1, H, D_h)                    # (B*P, H, D_h)
+        v = self.to_v(kv_normed).view(-1, H, D_h)                    # (B*P, H, D_h)
+
+        # Gather each point's assigned vertex query
+        q_per_point = q[global_cluster_idx]  # (B*P, H, D_h)
+
+        # Q·K: "how relevant is this point to the cluster's dominant feature?"
+        scores = (q_per_point * k).sum(dim=-1) * self.scale  # (B*P, H)
+
+        # Per-cluster softmax
+        alpha = scatter_softmax(scores, global_cluster_idx, dim=0)  # (B*P, H)
+
+        # Weighted aggregation
+        weighted = (alpha.unsqueeze(-1) * v).view(-1, self.output_dim)  # (B*P, output_dim)
+        weighted = weighted.to(point_feats.dtype)
+
+        attn_out = torch.zeros(total_clusters, self.output_dim,
+                               device=point_feats.device, dtype=weighted.dtype)
+        attn_out.scatter_add_(
+            0, global_cluster_idx.unsqueeze(-1).expand(-1, self.output_dim), weighted
+        )
+
+        # Residual: MaxPool base + attention refinement (to_out branch only)
+        refinement = self.to_out(attn_out)
+        vertex_feats = vertex_coarse + refinement
+
+        diagnostics = None
+        if return_diagnostics:
+            eps = 1e-8
+            r_mean = refinement.abs().mean()
+            c_mean = vertex_coarse.abs().mean()
+            diagnostics = {
+                'ca_residual_mean_abs': r_mean.item(),
+                'ca_coarse_mean_abs': c_mean.item(),
+                'ca_residual_to_coarse_ratio': (r_mean / (c_mean + eps)).item(),
+            }
+
+        # === Optional FeedForward + residual ===
+        if self.use_ffn:
+            vertex_feats = vertex_feats + self.ffn(self.norm_ffn(vertex_feats))
+
+        vertex_features = vertex_feats.view(B, V, self.output_dim)
+        if return_diagnostics:
+            return vertex_features, None, diagnostics
+        return vertex_features, None
 
 
 class VAEHead(nn.Module):

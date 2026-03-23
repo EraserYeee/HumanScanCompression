@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from utils.subdivision import BarycentricSubdivision
+from .timing_hooks import prof_start, prof_split
 
 def compute_rotation_matrices(normals: torch.Tensor) -> torch.Tensor:
     """
@@ -233,6 +234,8 @@ class NeuralSubdivisionDecoder(nn.Module):
         B, V, _ = base_verts.shape
         B = int(B) # Ensure B is int for view()
         _, num_faces, _ = base_faces.shape
+        do_log = getattr(self, "_profile_do_log", False)
+        t0 = prof_start() if do_log else None
         
         # 1. Generate Barycentric Coordinates
         # uv_A, uv_B: (F*K,)
@@ -246,6 +249,8 @@ class NeuralSubdivisionDecoder(nn.Module):
         # ln: Linear Normal (B, F*K, 3)
         ln = self.interpolate_barycentric(base_normals, base_faces, uv_A, uv_B)
         ln = F.normalize(ln, dim=-1, p=2)
+        if do_log:
+            t0 = prof_split(do_log, t0, "dec_bary_interp", "dec")
         
         # 3. Vertex-Centric Neural Displacement
         # Instead of interpolating features and pos-encoding barycentric coords,
@@ -376,6 +381,9 @@ class NeuralSubdivisionDecoder(nn.Module):
             disp = disp_flat # (B, F*K, 1)
             fine_verts = lp + disp * ln # Along interpolated normal
         
+        if do_log:
+            t0 = prof_split(do_log, t0, "dec_vertex_mlp", "dec")
+        
         # Note on 3D Offset: 
         # With MaxPooling on Invariant Features, predicting distinct X/Y tangential shifts is hard 
         # because the network has no reference for "Global X".
@@ -392,5 +400,7 @@ class NeuralSubdivisionDecoder(nn.Module):
         
         # 4. Build Topology (for rendering)
         fine_faces = self.subdivision.build_triangulated_faces(self.rate, num_triangles=num_faces)
+        if do_log:
+            prof_split(do_log, t0, "dec_topology", "dec")
         
         return fine_verts, fine_faces, disp

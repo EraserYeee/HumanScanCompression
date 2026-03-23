@@ -228,6 +228,14 @@ def train(config, args):
         model, optimizer, dataloader, scheduler
     )
     
+    # train.profile_timing: 耗时观测；profile_timing_interval: 每隔多少个 batch / forward 打印一次
+    profile_timing = bool(config.get("train", {}).get("profile_timing", False))
+    profile_interval = max(1, int(config.get("train", {}).get("profile_timing_interval", 50)))
+    _unwrap = accelerator.unwrap_model(model)
+    _unwrap._profile_timing = profile_timing
+    _unwrap._profile_interval = profile_interval
+    train_profile_batch_i = 0
+    
     # Resume from checkpoint if specified
     start_epoch = 0
     resume_path = config.get('resume_path', None)
@@ -300,8 +308,9 @@ def train(config, args):
                 
                 gt_verts_list = [v.to(accelerator.device) for v in batch['gt_verts']]
                 gt_faces_list = [f.to(accelerator.device) for f in batch['gt_faces']]
-                
-                # t_to_device = time.time()
+                t_tensors_on_device = time.time()
+                if profile_timing:
+                    train_profile_batch_i += 1
 
                 optimizer.zero_grad(set_to_none=True)
                 
@@ -313,9 +322,11 @@ def train(config, args):
                 loss_mat_batch = 0 # Matrix regularization loss
                 loss_kl_batch = 0  # VAE KL divergence loss
                 
-                # Check if we should collect diagnostics (only for attentive encoder)
-                enable_diagnostics = config['model'].get('encoder_type', 'standard') == 'attentive'
-                enable_diagnostics = enable_diagnostics and config.get('enable_attention_diagnostics', False)
+                # Diagnostics: attentive (full) or cross_attention (CA residual stats)
+                _et = config['model'].get('encoder_type', 'standard')
+                enable_diagnostics = _et in ('attentive', 'cross_attention') and config.get(
+                    'enable_attention_diagnostics', False
+                )
                 diagnostics_list = []  # Collect diagnostics from all batch items
                 
                 # Iterate over batch (Gradient Accumulation logic effectively)
@@ -324,233 +335,231 @@ def train(config, args):
                     if base_faces_list[b].shape[0] == 0:
                         continue
                     
-                # Single item forward
-                # Unsqueeze inputs to fake batch=1
-                # Ensure contiguous memory for .view() operations in model
-                b_verts = base_verts_list[b].unsqueeze(0).contiguous() # (1, V, 3)
-                b_faces = base_faces_list[b].unsqueeze(0).contiguous() # (1, F, 3)
-                b_normals = base_normals_list[b].unsqueeze(0).contiguous()
-                b_scan = scan_points[b].unsqueeze(0).contiguous() # (1, P, 3)
-                b_scan_normals = scan_normals[b].unsqueeze(0).contiguous() if scan_normals is not None else None
-                pred_img = None
-                gt_img = None
-                f_faces_expanded = None
-                loss = None
+                    # Single item forward
+                    # Unsqueeze inputs to fake batch=1
+                    # Ensure contiguous memory for .view() operations in model
+                    b_verts = base_verts_list[b].unsqueeze(0).contiguous() # (1, V, 3)
+                    b_faces = base_faces_list[b].unsqueeze(0).contiguous() # (1, F, 3)
+                    b_normals = base_normals_list[b].unsqueeze(0).contiguous()
+                    b_scan = scan_points[b].unsqueeze(0).contiguous() # (1, P, 3)
+                    b_scan_normals = scan_normals[b].unsqueeze(0).contiguous() if scan_normals is not None else None
+                    pred_img = None
+                    gt_img = None
+                    f_faces_expanded = None
+                    loss = None
                 
-                # Forward
-                if enable_diagnostics:
-                    result = model(
-                        b_verts, b_faces, b_normals, b_scan, scan_normals=b_scan_normals,
-                        return_diagnostics=True
-                    )
-                    if len(result) == 7:
-                        f_verts, f_faces, disp, trans_feat, vertex_features, model_kl_loss, diagnostics = result
-                        diagnostics_list.append(diagnostics)
+                    # Forward
+                    if enable_diagnostics:
+                        result = model(
+                            b_verts, b_faces, b_normals, b_scan, scan_normals=b_scan_normals,
+                            return_diagnostics=True
+                        )
+                        if len(result) == 7:
+                            f_verts, f_faces, disp, trans_feat, vertex_features, model_kl_loss, diagnostics = result
+                            diagnostics_list.append(diagnostics)
+                        else:
+                            # Fallback if diagnostics not available
+                            f_verts, f_faces, disp, trans_feat, vertex_features, model_kl_loss = result[:6]
                     else:
-                        # Fallback if diagnostics not available
-                        f_verts, f_faces, disp, trans_feat, vertex_features, model_kl_loss = result[:6]
-                else:
-                    f_verts, f_faces, disp, trans_feat, vertex_features, model_kl_loss = model(
-                        b_verts, b_faces, b_normals, b_scan, scan_normals=b_scan_normals
-                    )
+                        f_verts, f_faces, disp, trans_feat, vertex_features, model_kl_loss = model(
+                            b_verts, b_faces, b_normals, b_scan, scan_normals=b_scan_normals
+                        )
                 
-                # GT
-                g_verts = gt_verts_list[b].unsqueeze(0)
-                g_faces = gt_faces_list[b].unsqueeze(0)
+                    # GT
+                    g_verts = gt_verts_list[b].unsqueeze(0)
+                    g_faces = gt_faces_list[b].unsqueeze(0)
                 
-                # Check indices validity
-                is_valid = True
-                if f_faces.max() >= f_verts.shape[1]:
-                    if accelerator.is_main_process:
-                        print(f"[Error] Pred Faces max index {f_faces.max()} >= Pred Verts count {f_verts.shape[1]}")
-                    is_valid = False
-                if g_faces.max() >= g_verts.shape[1]:
-                    if accelerator.is_main_process:
-                        print(f"[Error] GT Faces max index {g_faces.max()} >= GT Verts count {g_verts.shape[1]}")
-                    is_valid = False
+                    # Check indices validity
+                    is_valid = True
+                    if f_faces.max() >= f_verts.shape[1]:
+                        if accelerator.is_main_process:
+                            print(f"[Error] Pred Faces max index {f_faces.max()} >= Pred Verts count {f_verts.shape[1]}")
+                        is_valid = False
+                    if g_faces.max() >= g_verts.shape[1]:
+                        if accelerator.is_main_process:
+                            print(f"[Error] GT Faces max index {g_faces.max()} >= GT Verts count {g_verts.shape[1]}")
+                        is_valid = False
                 
-                # Export Debug Mesh on error OR every 10 steps
-                should_export = (step % 3000 == 0 and b == 0) or (not is_valid)
-                # should_export = False
-                if should_export and accelerator.is_main_process:
-                    tag = "error" if not is_valid else f"step_{step}"
-                    debug_export_meshes(
-                        b_verts[0], b_faces[0], 
-                        f_verts[0], f_faces, 
-                        g_verts[0], g_faces[0],
-                        step, b, tag=tag
-                    )
-                    if not is_valid:
-                        # Release tensors before skipping this sample
-                        del f_verts, f_faces, disp, trans_feat, vertex_features
-                        if model_kl_loss is not None:
-                            del model_kl_loss
-                        if enable_diagnostics and 'diagnostics' in locals():
-                            # Remove diagnostics for this broken sample
-                            if diagnostics_list and len(diagnostics_list) > 0:
-                                diagnostics_list.pop()
-                        del b_verts, b_faces, b_normals, b_scan, g_verts, g_faces
-                        if b_scan_normals is not None:
-                            del b_scan_normals
-                        continue # Skip loss calculation for broken mesh
+                    # Export Debug Mesh on error OR every 10 steps
+                    should_export = (step % 3000 == 0 and b == 0) or (not is_valid)
+                    # should_export = False
+                    if should_export and accelerator.is_main_process:
+                        tag = "error" if not is_valid else f"step_{step}"
+                        debug_export_meshes(
+                            b_verts[0], b_faces[0], 
+                            f_verts[0], f_faces, 
+                            g_verts[0], g_faces[0],
+                            step, b, tag=tag
+                        )
+                        if not is_valid:
+                            # Release tensors before skipping this sample
+                            del f_verts, f_faces, disp, trans_feat, vertex_features
+                            if model_kl_loss is not None:
+                                del model_kl_loss
+                            if enable_diagnostics and 'diagnostics' in locals():
+                                # Remove diagnostics for this broken sample
+                                if diagnostics_list and len(diagnostics_list) > 0:
+                                    diagnostics_list.pop()
+                            del b_verts, b_faces, b_normals, b_scan, g_verts, g_faces
+                            if b_scan_normals is not None:
+                                del b_scan_normals
+                            continue # Skip loss calculation for broken mesh
 
-                # Loss for this item
+                    # Loss for this item
                 
-                # Check if using Chamfer Loss
-                loss_chamfer = torch.tensor(0.0, device=accelerator.device)
+                    # Check if using Chamfer Loss
+                    loss_chamfer = torch.tensor(0.0, device=accelerator.device)
                 
-                use_chamfer = config['loss'].get('use_chamfer', False)
+                    use_chamfer = config['loss'].get('use_chamfer', False)
                 
-                if use_chamfer:
-                    chamfer_result = chamfer_distance(f_verts, b_scan)
-                    loss_chamfer = chamfer_result[0]
-                    if len(chamfer_result) > 1:
-                        del chamfer_result[1]
-                    del chamfer_result
+                    if use_chamfer:
+                        chamfer_result = chamfer_distance(f_verts, b_scan)
+                        loss_chamfer = chamfer_result[0]
+                        if len(chamfer_result) > 1:
+                            del chamfer_result[1]
+                        del chamfer_result
                 
-                f_faces_expanded = f_faces.unsqueeze(0)
+                    f_faces_expanded = f_faces.unsqueeze(0)
                 
-                # Non-render losses (computed once, shared across view chunks)
-                loss_lap = torch.tensor(0.0, device=accelerator.device)
-                loss_disp = torch.tensor(0.0, device=accelerator.device)
-                loss_mat = torch.tensor(0.0, device=accelerator.device)
-                loss_kl = torch.tensor(0.0, device=accelerator.device)
-                if model_kl_loss is not None:
-                    vae_beta = config['loss'].get('vae_beta', 0.001)
-                    vae_warmup_epochs = config['loss'].get('vae_warmup_epochs', 50)
-                    if epoch < vae_warmup_epochs:
-                        beta = vae_beta * (epoch / max(vae_warmup_epochs, 1))
+                    # Non-render losses (computed once, shared across view chunks)
+                    loss_lap = torch.tensor(0.0, device=accelerator.device)
+                    loss_disp = torch.tensor(0.0, device=accelerator.device)
+                    loss_mat = torch.tensor(0.0, device=accelerator.device)
+                    loss_kl = torch.tensor(0.0, device=accelerator.device)
+                    if model_kl_loss is not None:
+                        vae_beta = config['loss'].get('vae_beta', 0.001)
+                        vae_warmup_epochs = config['loss'].get('vae_warmup_epochs', 50)
+                        if epoch < vae_warmup_epochs:
+                            beta = vae_beta * (epoch / max(vae_warmup_epochs, 1))
+                        else:
+                            beta = vae_beta
+                        loss_kl = beta * model_kl_loss
+                
+                    w_mat = config['loss'].get('w_mat', 0.001)
+                    if use_chamfer:
+                        w_chamfer = config['loss']['w_chamfer']
+                        w_render_weight = 0.0
                     else:
-                        beta = vae_beta
-                    loss_kl = beta * model_kl_loss
+                        w_chamfer = 0.0
+                        w_render_weight = config['loss']['w_render']
                 
-                w_mat = config['loss'].get('w_mat', 0.001)
-                if use_chamfer:
-                    w_chamfer = config['loss']['w_chamfer']
-                    w_render_weight = 0.0
-                else:
-                    w_chamfer = 0.0
-                    w_render_weight = config['loss']['w_render']
+                    loss_non_render = (
+                        w_chamfer * loss_chamfer +
+                        config['loss']['w_laplacian'] * loss_lap +
+                        config['loss']['w_disp'] * loss_disp +
+                        w_mat * loss_mat +
+                        loss_kl
+                    )
                 
-                loss_non_render = (
-                    w_chamfer * loss_chamfer +
-                    config['loss']['w_laplacian'] * loss_lap +
-                    config['loss']['w_disp'] * loss_disp +
-                    w_mat * loss_mat +
-                    loss_kl
-                )
+                    # View-chunked rendering with per-chunk backward to save VRAM.
+                    # Each chunk renders view_chunk_size views, computes render loss,
+                    # and calls backward (with retain_graph for non-last chunks).
+                    # This frees rendering intermediates between chunks while
+                    # accumulating gradients on model parameters.
+                    should_render = not use_chamfer or w_render_weight > 0
+                    loss_render_accum = 0.0
                 
-                # View-chunked rendering with per-chunk backward to save VRAM.
-                # Each chunk renders view_chunk_size views, computes render loss,
-                # and calls backward (with retain_graph for non-last chunks).
-                # This frees rendering intermediates between chunks while
-                # accumulating gradients on model parameters.
-                should_render = not use_chamfer or w_render_weight > 0
-                loss_render_accum = 0.0
-                
-                if should_render and num_view_chunks > 0:
-                    w_depth_l1 = config['loss'].get('w_depth_l1', 10.0)
-                    w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
-                    w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
-                    w_normal_lpips = config['loss'].get('w_normal_lpips', 0.5)
+                    if should_render and num_view_chunks > 0:
+                        w_depth_l1 = config['loss'].get('w_depth_l1', 10.0)
+                        w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
+                        w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
+                        w_normal_lpips = config['loss'].get('w_normal_lpips', 0.5)
                     
-                    for vc in range(num_view_chunks):
-                        is_last_chunk = (vc == num_view_chunks - 1)
+                        for vc in range(num_view_chunks):
+                            is_last_chunk = (vc == num_view_chunks - 1)
                         
-                        pred_img, gt_img, pred_depth, gt_depth = renderer(
-                            f_verts, f_faces_expanded, g_verts, g_faces
-                        )
+                            pred_img, gt_img, pred_depth, gt_depth = renderer(
+                                f_verts, f_faces_expanded, g_verts, g_faces
+                            )
                         
-                        loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
-                        loss_normal_l1 = torch.tensor(0.0, device=accelerator.device)
-                        loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
-                        loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
+                            loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
+                            loss_normal_l1 = torch.tensor(0.0, device=accelerator.device)
+                            loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
+                            loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
                         
-                        if w_depth_l1 > 0 and pred_depth is not None and gt_depth is not None:
-                            depth_mask = (pred_depth.abs() > 1e-6) & (gt_depth.abs() > 1e-6)
-                            if depth_mask.any():
-                                loss_depth_l1 = torch.nn.functional.l1_loss(
-                                    pred_depth[depth_mask], gt_depth[depth_mask]
-                                )
+                            if w_depth_l1 > 0 and pred_depth is not None and gt_depth is not None:
+                                depth_mask = (pred_depth.abs() > 1e-6) & (gt_depth.abs() > 1e-6)
+                                if depth_mask.any():
+                                    loss_depth_l1 = torch.nn.functional.l1_loss(
+                                        pred_depth[depth_mask], gt_depth[depth_mask]
+                                    )
                         
-                        if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
-                            normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
-                                         (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
-                            if normal_mask.any():
-                                pred_masked = pred_img * normal_mask
-                                gt_masked = gt_img * normal_mask
-                                loss_normal_l1 = torch.nn.functional.l1_loss(pred_masked, gt_masked)
+                            if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
+                                normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
+                                             (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
+                                if normal_mask.any():
+                                    pred_masked = pred_img * normal_mask
+                                    gt_masked = gt_img * normal_mask
+                                    loss_normal_l1 = torch.nn.functional.l1_loss(pred_masked, gt_masked)
                         
-                        if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
-                            pred_normal_norm = (pred_img + 1.0) * 0.5
-                            gt_normal_norm = (gt_img + 1.0) * 0.5
-                            pred_normal_norm = pred_normal_norm.permute(0, 3, 1, 2)
-                            gt_normal_norm = gt_normal_norm.permute(0, 3, 1, 2)
-                            ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
-                            loss_normal_ssim = 1.0 - ssim_val
+                            if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
+                                pred_normal_norm = (pred_img + 1.0) * 0.5
+                                gt_normal_norm = (gt_img + 1.0) * 0.5
+                                pred_normal_norm = pred_normal_norm.permute(0, 3, 1, 2)
+                                gt_normal_norm = gt_normal_norm.permute(0, 3, 1, 2)
+                                ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
+                                loss_normal_ssim = 1.0 - ssim_val
                         
-                        if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
-                            pred_normal_lpips_in = pred_img.permute(0, 3, 1, 2)
-                            gt_normal_lpips_in = gt_img.permute(0, 3, 1, 2)
-                            loss_normal_lpips = lpips_model(pred_normal_lpips_in, gt_normal_lpips_in).mean()
+                            if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
+                                pred_normal_lpips_in = pred_img.permute(0, 3, 1, 2)
+                                gt_normal_lpips_in = gt_img.permute(0, 3, 1, 2)
+                                loss_normal_lpips = lpips_model(pred_normal_lpips_in, gt_normal_lpips_in).mean()
                         
-                        chunk_render_loss = (
-                            w_depth_l1 * loss_depth_l1 +
-                            w_normal_l1 * loss_normal_l1 +
-                            w_normal_ssim * loss_normal_ssim +
-                            w_normal_lpips * loss_normal_lpips
-                        )
+                            chunk_render_loss = (
+                                w_depth_l1 * loss_depth_l1 +
+                                w_normal_l1 * loss_normal_l1 +
+                                w_normal_ssim * loss_normal_ssim +
+                                w_normal_lpips * loss_normal_lpips
+                            )
                         
-                        loss_render_accum += chunk_render_loss.item()
+                            loss_render_accum += chunk_render_loss.item()
                         
-                        # Render loss for this chunk, averaged over total chunks
-                        chunk_loss = w_render_weight * chunk_render_loss / num_view_chunks
-                        if is_last_chunk:
-                            chunk_loss = chunk_loss + loss_non_render
-                        chunk_loss = chunk_loss / len(base_verts_list)
+                            # Render loss for this chunk, averaged over total chunks
+                            chunk_loss = w_render_weight * chunk_render_loss / num_view_chunks
+                            if is_last_chunk:
+                                chunk_loss = chunk_loss + loss_non_render
+                            chunk_loss = chunk_loss / len(base_verts_list)
                         
-                        accelerator.backward(chunk_loss, retain_graph=not is_last_chunk)
+                            accelerator.backward(chunk_loss, retain_graph=not is_last_chunk)
                         
-                        if vc == 0 and should_export and accelerator.is_main_process:
-                            debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
+                            if vc == 0 and should_export and accelerator.is_main_process:
+                                debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
                         
-                        del pred_img, gt_img, pred_depth, gt_depth
-                        del chunk_render_loss, chunk_loss
-                        del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
-                else:
-                    loss_nr_scaled = loss_non_render / len(base_verts_list)
-                    accelerator.backward(loss_nr_scaled)
-                    del loss_nr_scaled
+                            del pred_img, gt_img, pred_depth, gt_depth
+                            del chunk_render_loss, chunk_loss
+                            del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
+                    else:
+                        loss_nr_scaled = loss_non_render / len(base_verts_list)
+                        accelerator.backward(loss_nr_scaled)
+                        del loss_nr_scaled
                 
-                loss_render_avg = loss_render_accum / max(num_view_chunks, 1)
-                total_loss_batch += (w_render_weight * loss_render_avg + loss_non_render.item()) / len(base_verts_list)
-                loss_render_batch += loss_render_avg
-                loss_chamfer_batch += loss_chamfer.item()
-                loss_lap_batch += loss_lap.item()
-                loss_disp_batch += loss_disp.item()
-                loss_mat_batch += loss_mat.item()
-                loss_kl_batch += loss_kl.item()
+                    loss_render_avg = loss_render_accum / max(num_view_chunks, 1)
+                    total_loss_batch += (w_render_weight * loss_render_avg + loss_non_render.item()) / len(base_verts_list)
+                    loss_render_batch += loss_render_avg
+                    loss_chamfer_batch += loss_chamfer.item()
+                    loss_lap_batch += loss_lap.item()
+                    loss_disp_batch += loss_disp.item()
+                    loss_mat_batch += loss_mat.item()
+                    loss_kl_batch += loss_kl.item()
                 
-                # Delete large tensors to free memory immediately
-                del f_verts, f_faces, disp, trans_feat, vertex_features
-                if model_kl_loss is not None:
-                    del model_kl_loss
-                del b_verts, b_faces, b_normals, b_scan
-                del g_verts, g_faces
-                if b_scan_normals is not None:
-                    del b_scan_normals
-                if f_faces_expanded is not None:
-                    del f_faces_expanded
-                del loss_non_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl
-            
-            # t_forward_backward = time.time()
-
+                    # Delete large tensors to free memory immediately
+                    del f_verts, f_faces, disp, trans_feat, vertex_features
+                    if model_kl_loss is not None:
+                        del model_kl_loss
+                    del b_verts, b_faces, b_normals, b_scan
+                    del g_verts, g_faces
+                    if b_scan_normals is not None:
+                        del b_scan_normals
+                    if f_faces_expanded is not None:
+                        del f_faces_expanded
+                    del loss_non_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl
+                
                 optimizer.step()
-                # t_step_end = time.time()
 
-                if accelerator.is_main_process:
-                    # print(f"Step {step} | Data: {t_data_avail - t_end:.4f}s | Device: {t_to_device - t_data_avail:.4f}s | Fwd+Bwd: {t_forward_backward - t_to_device:.4f}s | Step: {t_step_end - t_forward_backward:.4f}s")
-                    pass
+                if accelerator.is_main_process and profile_timing and (train_profile_batch_i % profile_interval == 0):
+                    gap_ms = (t_data_avail - t_end) * 1000
+                    h2d_ms = (t_tensors_on_device - t_data_avail) * 1000
+                    print(f"[timing/train] batch={train_profile_batch_i} dataloader_gap={gap_ms:.2f}ms to_device={h2d_ms:.2f}ms")
 
                 # Collect gradient information for diagnostics (after optimizer.step())
                 if enable_diagnostics and len(diagnostics_list) > 0:
@@ -607,6 +616,10 @@ def train(config, args):
                             elif key in ['num_points', 'num_clusters']:
                                 # Use first value (should be same across batch)
                                 avg_diag[key] = diagnostics_list[0][key]
+                            elif isinstance(diagnostics_list[0][key], (int, float)):
+                                values = [d[key] for d in diagnostics_list if key in d]
+                                if values:
+                                    avg_diag[key] = sum(values) / len(values)
                         
                         # Get gradient norm from first item (should be same after optimizer.step())
                         if diagnostics_list[0].get('score_linear_grad_norm') is not None:
@@ -651,6 +664,10 @@ def train(config, args):
                                 print(f"  Score Linear Grad Norm: {avg_diag['score_linear_grad_norm']:.8f}")
                             if 'score_linear_weight_norm' in avg_diag:
                                 print(f"  Score Linear Weight Norm: {avg_diag['score_linear_weight_norm']:.8f}")
+                            if 'ca_residual_mean_abs' in avg_diag:
+                                print(f"  CA residual |mean|: {avg_diag.get('ca_residual_mean_abs', 0):.6f}, "
+                                      f"coarse |mean|: {avg_diag.get('ca_coarse_mean_abs', 0):.6f}, "
+                                      f"ratio: {avg_diag.get('ca_residual_to_coarse_ratio', 0):.6f}")
                             print()
                     
                     accelerator.log(log_dict, step=step)

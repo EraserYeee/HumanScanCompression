@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from .grouper import LocalPatchGrouper
-from .encoder import LocalFeatureEncoder, AttentiveLocalFeatureEncoder, VAEHead
+from .timing_hooks import prof_start, prof_split, profile_is_rank0
+from .encoder import LocalFeatureEncoder, AttentiveLocalFeatureEncoder, CrossAttentionFeatureEncoder, VAEHead
 from .decoder import NeuralSubdivisionDecoder
 from .decoder_sumof_feature import SumOfFeatureDecoder
 
@@ -11,7 +12,7 @@ class Stage2Pipeline(nn.Module):
     Scan Point Cloud -> Base Mesh Anchored Features -> Fine Mesh
     
     支持:
-    - encoder_type: 'standard' (原始 MaxPool PointNet) 或 'attentive' (多头注意力池化)
+    - encoder_type: 'standard' | 'attentive' | 'cross_attention' (MaxPool-as-Q CA)
     - use_vae: 可选的 VAE 瓶颈头 (解耦设计，可独立开关)
     """
     def __init__(self, config):
@@ -34,7 +35,16 @@ class Stage2Pipeline(nn.Module):
         encoder_type = config.get('encoder_type', 'standard')
         print(f"Encoder Type Selected: {encoder_type}")
         
-        if encoder_type == 'attentive':
+        if encoder_type == 'cross_attention':
+            self.encoder = CrossAttentionFeatureEncoder(
+                input_dim=enc_input_dim,
+                hidden_dim=config.get('enc_hidden_dim', 64),
+                output_dim=config.get('feature_dim', 128),
+                num_heads=config.get('num_attention_heads', 4),
+                point_embed_hidden_dim=config.get('point_embed_hidden_dim', 48),
+                use_ffn=config.get('encoder_use_ffn', True)
+            )
+        elif encoder_type == 'attentive':
             self.encoder = AttentiveLocalFeatureEncoder(
                 input_dim=enc_input_dim,
                 hidden_dim=config.get('enc_hidden_dim', 64),
@@ -109,7 +119,7 @@ class Stage2Pipeline(nn.Module):
             scan_points: (B, P, 3)
             scan_normals: (B, P, 3) or None
             return_attention: bool, 是否返回注意力分数（仅当 encoder_type='attentive' 时有效）
-            return_diagnostics: bool, 是否返回诊断信息（仅当 encoder_type='attentive' 时有效）
+            return_diagnostics: bool, 是否返回诊断信息（attentive / cross_attention 时有效）
 
         Returns:
             fine_verts: (B, V_fine, 3)
@@ -120,10 +130,21 @@ class Stage2Pipeline(nn.Module):
             kl_loss: scalar or None (VAE KL divergence loss)
             attention_scores: (B*P, H) or None, 注意力分数（仅当 return_attention=True 且 encoder_type='attentive'）
             global_cluster_idx: (B*P,) or None, 全局 cluster 索引（仅当 return_attention=True 且 encoder_type='attentive'）
-            diagnostics: dict or None, 诊断信息（仅当 return_diagnostics=True 且 encoder_type='attentive'）
+            diagnostics: dict or None, 诊断信息（仅当 return_diagnostics=True 且 encoder 为 attentive/cross_attention）
         """
+        do_log = bool(getattr(self, "_profile_timing", False))
+        if do_log:
+            self._profile_counter = getattr(self, "_profile_counter", 0) + 1
+            iv = int(getattr(self, "_profile_interval", 50))
+            do_log = (self._profile_counter % max(iv, 1)) == 0 and profile_is_rank0()
+        for _sub in (self.grouper, self.encoder, self.decoder):
+            setattr(_sub, "_profile_do_log", do_log)
+
         # 1. Grouping
+        t0 = prof_start() if do_log else None
         local_points, cluster_idx = self.grouper(base_verts, base_normals, scan_points)
+        if do_log:
+            prof_split(True, t0, "grouper", "pipe")
 
         # 2. Encoding
         # 注意: num_verts 需要处理 batch 内可能不一致的情况，通常取 max
@@ -134,33 +155,62 @@ class Stage2Pipeline(nn.Module):
         
         # Check if encoder supports attention return
         is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
+        is_cross_attn = isinstance(self.encoder, CrossAttentionFeatureEncoder)
         diagnostics = None
         
         if return_attention and is_attentive:
+            t0 = prof_start() if do_log else None
             result = self.encoder(
                 encoder_input, cluster_idx, num_verts=V, 
                 return_attention=True, return_diagnostics=return_diagnostics
             )
+            if do_log:
+                prof_split(True, t0, "encoder(total)", "pipe")
             if return_diagnostics:
                 vertex_features, trans_feat, attention_scores, global_cluster_idx, diagnostics = result
             else:
                 vertex_features, trans_feat, attention_scores, global_cluster_idx = result
         elif return_diagnostics and is_attentive:
+            t0 = prof_start() if do_log else None
             vertex_features, trans_feat, diagnostics = self.encoder(
                 encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
             )
+            if do_log:
+                prof_split(True, t0, "encoder(total)", "pipe")
+            attention_scores, global_cluster_idx = None, None
+        elif is_cross_attn:
+            t0 = prof_start() if do_log else None
+            if return_diagnostics:
+                vertex_features, trans_feat, diagnostics = self.encoder(
+                    encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
+                )
+            else:
+                vertex_features, trans_feat = self.encoder(
+                    encoder_input, cluster_idx, num_verts=V
+                )
+            if do_log:
+                prof_split(True, t0, "encoder(total)", "pipe")
             attention_scores, global_cluster_idx = None, None
         else:
+            t0 = prof_start() if do_log else None
             vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
+            if do_log:
+                prof_split(True, t0, "encoder(total)", "pipe")
             attention_scores, global_cluster_idx = None, None
 
         # 2.5 VAE Bottleneck (optional)
         kl_loss = None
         if self.vae_head is not None:
+            t0 = prof_start() if do_log else None
             vertex_features, kl_loss = self.vae_head(vertex_features)
+            if do_log:
+                prof_split(True, t0, "vae_head", "pipe")
 
         # 3. Decoding
+        t0 = prof_start() if do_log else None
         fine_verts, fine_faces, displacements = self.decoder(base_verts, base_faces, vertex_features, base_normals)
+        if do_log:
+            prof_split(True, t0, "decoder(total)", "pipe")
 
         if return_attention and is_attentive:
             if return_diagnostics:
@@ -168,6 +218,8 @@ class Stage2Pipeline(nn.Module):
             else:
                 return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, attention_scores, global_cluster_idx
         elif return_diagnostics and is_attentive:
+            return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, diagnostics
+        elif return_diagnostics and is_cross_attn:
             return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss, diagnostics
         else:
             return fine_verts, fine_faces, displacements, trans_feat, vertex_features, kl_loss

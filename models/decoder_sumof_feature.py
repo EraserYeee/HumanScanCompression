@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 from utils.subdivision import BarycentricSubdivision
 from torch_scatter import scatter_mean
+from .timing_hooks import prof_start, prof_split
 
 def positional_encoding(vector: torch.Tensor, extras: list[torch.Tensor], levels: int) -> torch.Tensor:
     """
@@ -25,16 +26,16 @@ def positional_encoding(vector: torch.Tensor, extras: list[torch.Tensor], levels
 
 class SumOfFeatureDecoder(nn.Module):
     """
-    Decoder Architecture: Barycentric Feature Interpolation
+    Decoder Architecture: MLP_F over triangle anchors
     
     Logic:
-    1. For each subdivision point, interpolate the 3 anchor vertex features
-       using the point's barycentric coordinates as weights:
-       H = w0 * feat_0 + w1 * feat_1 + w2 * feat_2
-    2. Predict displacement from interpolated feature:
-       - d = MLP_G(H, normal)           [if predict_scalar]
-       - d = MLP_G(H)                   [if predict_offset]
-    3. Stitch Seams:
+    1. For each subdivision point, use the 3 triangle vertices as anchors (via the
+       triangle correspondence induced by barycentric sampling).
+    2. For each anchor i, map concat([feat_i, delta]) or concat([feat_i, PE(delta]])
+       with `mlp_feature_map` into hidden space.
+    3. Sum the 3 mapped hidden vectors to get `H_agg`.
+    4. Predict displacement from `H_agg` (and optionally normal, with optional PE).
+    5. Stitch Seams:
        - Average predicted displacements for shared subdivision points.
        
     Args:
@@ -60,24 +61,24 @@ class SumOfFeatureDecoder(nn.Module):
             hidden_dims = [hidden_dim, hidden_dim]
         else:
             hidden_dims = list(hidden_dim)
-        #         # --- MLP F (Feature Mapper) ---
-        # input_dim_F = feature_dim
-        # if self.posenc_mode == 0:
-        #     input_dim_F += 3
-        # else:
-        #     input_dim_F += 3 * 2 * levels
         
-        # layers_f = []
-        # dims_f = [input_dim_F] + hidden_dims
-        # for i in range(len(hidden_dims)):
-        #     layers_f.extend([nn.Linear(dims_f[i], dims_f[i + 1]), nn.LeakyReLU()])
-        # self.mlp_feature_map = nn.Sequential(*layers_f)
+        # --- MLP F (Feature Mapper) ---
+        # Build MLP inputs as: concat([feature_i, delta] or [feature_i, PE(delta)])
+        input_dim_F = feature_dim
+        if self.posenc_mode == 0:
+            input_dim_F += 3
+        else:
+            input_dim_F += 3 * 2 * levels
         
-        # input_dim_G = hidden_dims[-1]
+        layers_f = []
+        dims_f = [input_dim_F] + hidden_dims
+        for i in range(len(hidden_dims)):
+            layers_f.extend([nn.Linear(dims_f[i], dims_f[i + 1]), nn.LeakyReLU()])
+        self.mlp_feature_map = nn.Sequential(*layers_f)
+        
         # --- MLP G (Predictor) ---
-        # Feature aggregation is now done via barycentric interpolation (no MLP_F),
-        # so MLP_G takes feature_dim directly.
-        input_dim_G = feature_dim
+        # After sum of mapped features: H_agg in R^{hidden_dims[-1]}
+        input_dim_G = hidden_dims[-1]
         if not self.predict_offset:
             if self.posenc_mode == 2:
                 input_dim_G += 3 * 2 * levels
@@ -148,6 +149,8 @@ class SumOfFeatureDecoder(nn.Module):
         B, V, _ = base_verts.shape
         B = int(B)
         _, num_faces, _ = base_faces.shape
+        do_log = getattr(self, "_profile_do_log", False)
+        t0 = prof_start() if do_log else None
         
         # 1. Generate Barycentric Coordinates
         uv_A, uv_B = self.subdivision.sample_uniform_bary(self.rate, num_triangles=num_faces)
@@ -160,62 +163,45 @@ class SumOfFeatureDecoder(nn.Module):
         ln = self.interpolate_barycentric(base_normals, base_faces, uv_A, uv_B)
         ln = F.normalize(ln, dim=-1, p=2)
         
-        # 3. Barycentric Interpolation of Features
-        # Directly interpolate vertex features using barycentric coordinates:
-        #   uv_A -> vertex 0, uv_B -> vertex 1, (1-uv_A-uv_B) -> vertex 2
-        feat_interp = self.interpolate_barycentric(vertex_features, base_faces, uv_A, uv_B)
-        #         # 3.1 Gather vertex attributes
-        # batch_offset = (torch.arange(B, device=base_verts.device) * V).view(-1, 1, 1)
-        # flat_faces = (base_faces + batch_offset).view(-1)
+        # 3. Sum of mapped features from the 3 triangle anchor vertices
+        # Correspondence (must match barycentric order):
+        #   uv_A -> vertex 0
+        #   uv_B -> vertex 1
+        #   1-uv_A-uv_B -> vertex 2
+        # We compute features by looping over the same 3 vertices.
+        batch_offset = (torch.arange(B, device=base_verts.device) * V).view(-1, 1, 1)
+        flat_faces = (base_faces + batch_offset).view(-1)
         
-        # # Features: (B, F, 3, D)
-        # flat_feats = vertex_features.view(-1, vertex_features.shape[-1])
-        # face_feats = flat_feats[flat_faces].view(B, num_faces, 3, -1)
+        # Face vertex features/positions: (B, F, 3, *)
+        flat_feats = vertex_features.view(-1, vertex_features.shape[-1])
+        face_feats = flat_feats[flat_faces].view(B, num_faces, 3, -1)
         
-        # # Vertices: (B, F, 3, 3)
-        # flat_verts = base_verts.view(-1, 3)
-        # face_verts = flat_verts[flat_faces].view(B, num_faces, 3, 3)
+        flat_verts = base_verts.view(-1, 3)
+        face_verts = flat_verts[flat_faces].view(B, num_faces, 3, 3)
         
-        # # Reshape lp to (B, F, K, 3)
-        # lp_reshaped = lp.view(B, num_faces, K, 3)
-        
-        # # Initialize Aggregated Feature H
-        # # H shape: (B, F, K, hidden_dim)
-        # H_agg = 0
-        
-        # # Loop over 3 vertices to sum mapped features
-        # for i in range(3):
-        #     # Vertex position: (B, F, 1, 3)
-        #     v_pos = face_verts[:, :, i, :].unsqueeze(2)
-            
-        #     # Relative position (Global Relative): (B, F, K, 3)
-        #     delta = lp_reshaped - v_pos
-            
-        #     # Feature: (B, F, K, D)
-        #     feat = face_feats[:, :, i, :].unsqueeze(2).expand(-1, -1, K, -1)
-            
-        #     # Prepare Input for MLP F
-        #     mlp_f_in_list = [feat]
-            
-        #     if self.posenc_mode == 0:
-        #         mlp_f_in_list.append(delta)
-        #     else:
-        #         # Mode 1 or 2: Apply PosEnc to DeltaP
-        #         pe_delta = positional_encoding(delta, [], self.fflevels)
-        #         mlp_f_in_list.append(pe_delta)
-            
-        #     # Concat
-        #     mlp_f_in = torch.cat(mlp_f_in_list, dim=-1) # (B, F, K, InputDim_F)
-            
-        #     # Map Feature
-        #     # Flatten for MLP: (B*F*K, InputDim_F)
-        #     h_i = self.mlp_feature_map(mlp_f_in.view(-1, mlp_f_in.shape[-1]))
-            
-        #     # Reshape back and Accumulate
-        #     h_i = h_i.view(B, num_faces, K, -1)
-        #     H_agg = H_agg + h_i
         K = uv_A.shape[0] // num_faces
-        H_agg = feat_interp.view(B, num_faces, K, -1)
+        lp_reshaped = lp.view(B, num_faces, K, 3)
+        
+        # Aggregated hidden feature:
+        H_agg = 0
+        for i in range(3):
+            v_pos = face_verts[:, :, i, :].unsqueeze(2)  # (B, F, 1, 3)
+            delta = lp_reshaped - v_pos                  # (B, F, K, 3)
+            
+            feat = face_feats[:, :, i, :].unsqueeze(2).expand(-1, -1, K, -1)  # (B, F, K, D)
+            
+            mlp_f_in_list = [feat]
+            if self.posenc_mode == 0:
+                mlp_f_in_list.append(delta)
+            else:
+                pe_delta = positional_encoding(delta, [], self.fflevels)
+                mlp_f_in_list.append(pe_delta)
+            
+            mlp_f_in = torch.cat(mlp_f_in_list, dim=-1)  # (B, F, K, InputDim_F)
+            
+            h_i = self.mlp_feature_map(mlp_f_in.view(-1, mlp_f_in.shape[-1]))
+            h_i = h_i.view(B, num_faces, K, -1)
+            H_agg = H_agg + h_i
             
         # 4. Final Prediction using MLP G
         
@@ -268,6 +254,8 @@ class SumOfFeatureDecoder(nn.Module):
         
         # Reshape to (B, F*K, D)
         disp_flat = disp_stitched.view(B, -1, disp_flat.shape[-1])
+        if do_log:
+            t0 = prof_split(do_log, t0, "sof_mlp_stitch", "dec")
         
         # 6. Apply Displacement
         if self.predict_offset:
@@ -279,5 +267,7 @@ class SumOfFeatureDecoder(nn.Module):
             
         # Build Topology
         fine_faces = self.subdivision.build_triangulated_faces(self.rate, num_triangles=num_faces)
+        if do_log:
+            prof_split(do_log, t0, "sof_topology", "dec")
         
         return fine_verts, fine_faces, disp_flat
