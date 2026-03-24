@@ -53,6 +53,49 @@ except ImportError:
     lpips = None
 
 
+def compute_normal_loss_geo(pred_normal, gt_normal, mask):
+    """
+    Geometric normal loss from:
+      L = (1 - N_hat·N) + ||N_hat - N||^2 + ||∇N_hat - ∇N||^2
+    
+    Args:
+        pred_normal: (B, H, W, 3) predicted normal map
+        gt_normal:   (B, H, W, 3) ground-truth normal map
+        mask:        (B, H, W, 1) boolean mask for valid pixels
+    Returns:
+        scalar loss (mean over valid pixels)
+    """
+    mask_f = mask.float()
+    num_valid = mask_f.sum().clamp(min=1.0)
+
+    pred_n = torch.nn.functional.normalize(pred_normal, dim=-1, p=2)
+    gt_n = torch.nn.functional.normalize(gt_normal, dim=-1, p=2)
+
+    # Term 1: cosine distance
+    cos_dist = (1.0 - (pred_n * gt_n).sum(dim=-1, keepdim=True)) * mask_f
+    loss_cos = cos_dist.sum() / num_valid
+
+    # Term 2: L2 distance
+    l2_dist = ((pred_n - gt_n) ** 2).sum(dim=-1, keepdim=True) * mask_f
+    loss_l2 = l2_dist.sum() / num_valid
+
+    # Term 3: spatial gradient consistency (finite differences along H and W)
+    # dx: difference along W; dy: difference along H
+    pred_dx = pred_n[:, :, 1:, :] - pred_n[:, :, :-1, :]
+    gt_dx = gt_n[:, :, 1:, :] - gt_n[:, :, :-1, :]
+    pred_dy = pred_n[:, 1:, :, :] - pred_n[:, :-1, :, :]
+    gt_dy = gt_n[:, 1:, :, :] - gt_n[:, :-1, :, :]
+
+    mask_dx = mask_f[:, :, 1:, :] * mask_f[:, :, :-1, :]
+    mask_dy = mask_f[:, 1:, :, :] * mask_f[:, :-1, :, :]
+
+    grad_loss_x = (((pred_dx - gt_dx) ** 2).sum(dim=-1, keepdim=True) * mask_dx).sum() / mask_dx.sum().clamp(min=1.0)
+    grad_loss_y = (((pred_dy - gt_dy) ** 2).sum(dim=-1, keepdim=True) * mask_dy).sum() / mask_dy.sum().clamp(min=1.0)
+    loss_grad = grad_loss_x + grad_loss_y
+
+    return loss_cos + loss_l2 + loss_grad
+
+
 def load_config(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -461,9 +504,11 @@ def train(config, args):
                 
                     if should_render and num_view_chunks > 0:
                         w_depth_l1 = config['loss'].get('w_depth_l1', 10.0)
+                        normal_loss_type = config['loss'].get('normal_loss_type', 'l1')
                         w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
                         w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
                         w_normal_lpips = config['loss'].get('w_normal_lpips', 0.5)
+                        w_normal_geo = config['loss'].get('w_normal_geo', 4.0)
                     
                         for vc in range(num_view_chunks):
                             is_last_chunk = (vc == num_view_chunks - 1)
@@ -473,9 +518,6 @@ def train(config, args):
                             )
                         
                             loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
-                            loss_normal_l1 = torch.tensor(0.0, device=accelerator.device)
-                            loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
-                            loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
                         
                             if w_depth_l1 > 0 and pred_depth is not None and gt_depth is not None:
                                 depth_mask = (pred_depth.abs() > 1e-6) & (gt_depth.abs() > 1e-6)
@@ -484,33 +526,49 @@ def train(config, args):
                                         pred_depth[depth_mask], gt_depth[depth_mask]
                                     )
                         
-                            if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
-                                normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
-                                             (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
-                                if normal_mask.any():
-                                    pred_masked = pred_img * normal_mask
-                                    gt_masked = gt_img * normal_mask
-                                    loss_normal_l1 = torch.nn.functional.l1_loss(pred_masked, gt_masked)
-                        
-                            if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
-                                pred_normal_norm = (pred_img + 1.0) * 0.5
-                                gt_normal_norm = (gt_img + 1.0) * 0.5
-                                pred_normal_norm = pred_normal_norm.permute(0, 3, 1, 2)
-                                gt_normal_norm = gt_normal_norm.permute(0, 3, 1, 2)
-                                ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
-                                loss_normal_ssim = 1.0 - ssim_val
-                        
-                            if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
-                                pred_normal_lpips_in = pred_img.permute(0, 3, 1, 2)
-                                gt_normal_lpips_in = gt_img.permute(0, 3, 1, 2)
-                                loss_normal_lpips = lpips_model(pred_normal_lpips_in, gt_normal_lpips_in).mean()
-                        
-                            chunk_render_loss = (
-                                w_depth_l1 * loss_depth_l1 +
-                                w_normal_l1 * loss_normal_l1 +
-                                w_normal_ssim * loss_normal_ssim +
-                                w_normal_lpips * loss_normal_lpips
-                            )
+                            if normal_loss_type == 'geo':
+                                loss_normal_geo_val = torch.tensor(0.0, device=accelerator.device)
+                                if w_normal_geo > 0 and pred_img is not None and gt_img is not None:
+                                    normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
+                                                 (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
+                                    if normal_mask.any():
+                                        loss_normal_geo_val = compute_normal_loss_geo(pred_img, gt_img, normal_mask)
+                                chunk_render_loss = (
+                                    w_depth_l1 * loss_depth_l1 +
+                                    w_normal_geo * loss_normal_geo_val
+                                )
+                            else:
+                                loss_normal_l1_val = torch.tensor(0.0, device=accelerator.device)
+                                loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
+                                loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
+
+                                if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
+                                    normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
+                                                 (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
+                                    if normal_mask.any():
+                                        pred_masked = pred_img * normal_mask
+                                        gt_masked = gt_img * normal_mask
+                                        loss_normal_l1_val = torch.nn.functional.l1_loss(pred_masked, gt_masked)
+
+                                if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
+                                    pred_normal_norm = (pred_img + 1.0) * 0.5
+                                    gt_normal_norm = (gt_img + 1.0) * 0.5
+                                    pred_normal_norm = pred_normal_norm.permute(0, 3, 1, 2)
+                                    gt_normal_norm = gt_normal_norm.permute(0, 3, 1, 2)
+                                    ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
+                                    loss_normal_ssim = 1.0 - ssim_val
+
+                                if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
+                                    pred_normal_lpips_in = pred_img.permute(0, 3, 1, 2)
+                                    gt_normal_lpips_in = gt_img.permute(0, 3, 1, 2)
+                                    loss_normal_lpips = lpips_model(pred_normal_lpips_in, gt_normal_lpips_in).mean()
+
+                                chunk_render_loss = (
+                                    w_depth_l1 * loss_depth_l1 +
+                                    w_normal_l1 * loss_normal_l1_val +
+                                    w_normal_ssim * loss_normal_ssim +
+                                    w_normal_lpips * loss_normal_lpips
+                                )
                         
                             loss_render_accum += chunk_render_loss.item()
                         
@@ -527,7 +585,6 @@ def train(config, args):
                         
                             del pred_img, gt_img, pred_depth, gt_depth
                             del chunk_render_loss, chunk_loss
-                            del loss_depth_l1, loss_normal_l1, loss_normal_ssim, loss_normal_lpips
                     else:
                         loss_nr_scaled = loss_non_render / len(base_verts_list)
                         accelerator.backward(loss_nr_scaled)
