@@ -43,15 +43,6 @@ except ImportError:
     def ssim(*args, **kwargs):
         return torch.tensor(0.0, device=args[0].device if args else 'cuda')
 
-# 尝试导入 LPIPS
-try:
-    import lpips
-    HAS_LPIPS = True
-except ImportError:
-    HAS_LPIPS = False
-    print("[Warn] lpips not found. LPIPS loss will be disabled.")
-    lpips = None
-
 
 def compute_normal_loss_geo(pred_normal, gt_normal, mask):
     """
@@ -241,16 +232,6 @@ def train(config, args):
         cameras_per_batch=view_chunk_size,
         dist_multiplier=config['render'].get('dist_multiplier', 1.0)
     )
-    
-    # Setup LPIPS loss model if available
-    lpips_model = None
-    if HAS_LPIPS:
-        lpips_model = lpips.LPIPS(net='vgg').to(accelerator.device)
-        lpips_model.eval()
-        for param in lpips_model.parameters():
-            param.requires_grad = False
-    else:
-        assert("no lpips model found")
 
     # 5. Optimizer
     optimizer = optim.AdamW(
@@ -507,7 +488,6 @@ def train(config, args):
                         normal_loss_type = config['loss'].get('normal_loss_type', 'l1')
                         w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
                         w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
-                        w_normal_lpips = config['loss'].get('w_normal_lpips', 0.5)
                         w_normal_geo = config['loss'].get('w_normal_geo', 4.0)
                     
                         for vc in range(num_view_chunks):
@@ -540,7 +520,6 @@ def train(config, args):
                             else:
                                 loss_normal_l1_val = torch.tensor(0.0, device=accelerator.device)
                                 loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
-                                loss_normal_lpips = torch.tensor(0.0, device=accelerator.device)
 
                                 if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
                                     normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
@@ -558,16 +537,10 @@ def train(config, args):
                                     ssim_val = ssim(pred_normal_norm, gt_normal_norm, data_range=1.0)
                                     loss_normal_ssim = 1.0 - ssim_val
 
-                                if w_normal_lpips > 0 and HAS_LPIPS and lpips_model is not None and pred_img is not None and gt_img is not None:
-                                    pred_normal_lpips_in = pred_img.permute(0, 3, 1, 2)
-                                    gt_normal_lpips_in = gt_img.permute(0, 3, 1, 2)
-                                    loss_normal_lpips = lpips_model(pred_normal_lpips_in, gt_normal_lpips_in).mean()
-
                                 chunk_render_loss = (
                                     w_depth_l1 * loss_depth_l1 +
                                     w_normal_l1 * loss_normal_l1_val +
-                                    w_normal_ssim * loss_normal_ssim +
-                                    w_normal_lpips * loss_normal_lpips
+                                    w_normal_ssim * loss_normal_ssim
                                 )
                         
                             loss_render_accum += chunk_render_loss.item()

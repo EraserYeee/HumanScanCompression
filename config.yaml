@@ -24,7 +24,6 @@ loss:
   w_laplacian: 0.0
   w_mat: 0.001
   w_normal_l1: 4.0
-  w_normal_lpips: 0.5
   w_normal_ssim: 0.5
   w_render: 1.0
 model:
