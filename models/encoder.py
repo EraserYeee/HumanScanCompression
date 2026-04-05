@@ -517,6 +517,178 @@ class CrossAttentionFeatureEncoder(nn.Module):
         return vertex_features, None
 
 
+class SinusoidalPositionEncoding(nn.Module):
+    """Multi-frequency sinusoidal encoding for 3-D coordinates."""
+    def __init__(self, num_frequencies: int = 4):
+        super().__init__()
+        self.num_frequencies = num_frequencies
+        # output dim per coordinate = 2*num_frequencies  (sin + cos)
+        # total output dim = 3 * 2 * num_frequencies
+        freqs = 2.0 ** torch.arange(num_frequencies).float() * torch.pi
+        self.register_buffer("freqs", freqs)  # (L,)
+
+    @property
+    def out_dim(self) -> int:
+        return 3 * 2 * self.num_frequencies
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            coords: (..., 3)
+        Returns:
+            pe: (..., 3*2*L)
+        """
+        # coords: (..., 3) -> (..., 3, 1) * (L,) -> (..., 3, L)
+        x = coords.unsqueeze(-1) * self.freqs  # (..., 3, L)
+        pe = torch.cat([x.sin(), x.cos()], dim=-1)  # (..., 3, 2L)
+        return pe.flatten(-2)  # (..., 3*2L)
+
+
+class TransformerSABlock(nn.Module):
+    """Pre-norm Transformer self-attention block with residual."""
+    def __init__(self, dim: int, num_heads: int = 4, use_ffn: bool = True, ffn_mult: int = 4):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert dim % num_heads == 0
+
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim)
+
+        self.use_ffn = use_ffn
+        if use_ffn:
+            self.norm2 = nn.LayerNorm(dim)
+            self.ffn = nn.Sequential(
+                nn.Linear(dim, dim * ffn_mult),
+                nn.GELU(),
+                nn.Linear(dim * ffn_mult, dim),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (N, S, D)  –  N sequences of length S
+        Returns:
+            x: (N, S, D)
+        """
+        H, D_h = self.num_heads, self.head_dim
+        residual = x
+        x_norm = self.norm1(x)
+        N, S, D = x_norm.shape
+
+        qkv = self.qkv(x_norm).reshape(N, S, 3, H, D_h).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # each (N, H, S, D_h)
+
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # Flash-eligible
+        x = x.transpose(1, 2).reshape(N, S, D)
+        x = self.out_proj(x)
+        x = residual + x
+
+        if self.use_ffn:
+            x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class PTSAEncoder(nn.Module):
+    """
+    Point Transformer Self-Attention encoder that operates on fixed-size
+    vertex neighbourhoods produced by VertexKNNGrouper.
+
+    Pipeline:
+        grouped_features (B,V,K,D_in) -> light MLP -> sinusoidal PE concat
+        -> N × SA blocks -> pooling (max / attentive) -> projection -> (B,V,feature_dim)
+    """
+    def __init__(
+        self,
+        input_dim: int = 6,
+        hidden_dims: list | None = None,
+        sa_dim: int = 128,
+        num_heads: int = 4,
+        num_sa_layers: int = 1,
+        feature_dim: int = 512,
+        pooling_type: str = "attentive",
+        use_ffn: bool = True,
+        pe_num_frequencies: int = 4,
+    ):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [64]
+        self.sa_dim = sa_dim
+        self.feature_dim = feature_dim
+        self.pooling_type = pooling_type
+
+        # --- MLP backbone (per-point, shared) ---
+        layers = []
+        in_d = input_dim
+        for h_d in hidden_dims:
+            layers.extend([nn.Linear(in_d, h_d), nn.BatchNorm1d(h_d), nn.ReLU()])
+            in_d = h_d
+        layers.extend([nn.Linear(in_d, sa_dim), nn.BatchNorm1d(sa_dim), nn.ReLU()])
+        self.backbone = nn.Sequential(*layers)
+
+        # --- Sinusoidal position encoding + projection ---
+        self.pe = SinusoidalPositionEncoding(num_frequencies=pe_num_frequencies)
+        self.pe_proj = nn.Linear(sa_dim + self.pe.out_dim, sa_dim)
+
+        # --- Transformer SA blocks ---
+        self.sa_layers = nn.ModuleList(
+            [TransformerSABlock(sa_dim, num_heads=num_heads, use_ffn=use_ffn)
+             for _ in range(num_sa_layers)]
+        )
+
+        # --- Pooling head ---
+        if pooling_type == "attentive":
+            self.pool_score = nn.Linear(sa_dim, 1)
+        # (max pooling needs no parameters)
+
+        # --- Output projection ---
+        self.out_proj = nn.Linear(sa_dim, feature_dim)
+
+    def forward(
+        self,
+        grouped_features: torch.Tensor,
+        local_coords: torch.Tensor,
+    ):
+        """
+        Args:
+            grouped_features: (B, V, K, D_in) – output of VertexKNNGrouper
+            local_coords:     (B, V, K, 3)    – relative positions for PE
+
+        Returns:
+            vertex_features: (B, V, feature_dim)
+            trans_feat:      None  (API compatibility with old encoders)
+        """
+        B, V, K, D_in = grouped_features.shape
+
+        # --- Per-point MLP ---
+        x = grouped_features.reshape(B * V * K, D_in)
+        x = self.backbone(x)                    # (B*V*K, sa_dim)
+        x = x.reshape(B * V, K, self.sa_dim)
+
+        # --- Add sinusoidal PE ---
+        pe = self.pe(local_coords.reshape(B * V, K, 3))  # (B*V, K, pe_dim)
+        x = self.pe_proj(torch.cat([x, pe], dim=-1))      # (B*V, K, sa_dim)
+
+        # --- Self-attention blocks ---
+        for layer in self.sa_layers:
+            x = layer(x)                         # (B*V, K, sa_dim)
+
+        # --- Pooling ---
+        if self.pooling_type == "attentive":
+            scores = self.pool_score(x).squeeze(-1)     # (B*V, K)
+            alpha = torch.softmax(scores, dim=-1)       # (B*V, K)
+            pooled = (alpha.unsqueeze(-1) * x).sum(dim=1)  # (B*V, sa_dim)
+        else:  # max
+            pooled = x.max(dim=1).values                # (B*V, sa_dim)
+
+        # --- Project to feature_dim ---
+        vertex_feats = self.out_proj(pooled)             # (B*V, feature_dim)
+        vertex_feats = vertex_feats.reshape(B, V, self.feature_dim)
+
+        return vertex_feats, None
+
+
 class VAEHead(nn.Module):
     """
     变分自编码器 (VAE) 瓶颈头。

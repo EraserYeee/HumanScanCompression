@@ -1,8 +1,14 @@
 import torch
 import torch.nn as nn
-from .grouper import LocalPatchGrouper
+from .grouper import LocalPatchGrouper, VertexKNNGrouper
 from .timing_hooks import prof_start, prof_split, profile_is_rank0
-from .encoder import LocalFeatureEncoder, AttentiveLocalFeatureEncoder, CrossAttentionFeatureEncoder, VAEHead
+from .encoder import (
+    LocalFeatureEncoder,
+    AttentiveLocalFeatureEncoder,
+    CrossAttentionFeatureEncoder,
+    PTSAEncoder,
+    VAEHead,
+)
 from .decoder import NeuralSubdivisionDecoder
 from .decoder_sumof_feature import SumOfFeatureDecoder
 
@@ -20,8 +26,18 @@ class Stage2Pipeline(nn.Module):
         # Check if we should predict global offset (xyz) instead of scalar displacement
         predict_offset = config.get('predict_offset', False)
         
-        # If predicting global offset, we use global relative coordinates in Grouper (no rotation)
-        self.grouper = LocalPatchGrouper(use_global_coordinates=predict_offset)
+        # === Grouper Selection ===
+        grouper_type = config.get('grouper_type', 'scan_knn')
+        self.grouper_type = grouper_type
+
+        if grouper_type == 'vertex_knn':
+            knn_k = config.get('vertex_knn_k', 512)
+            knn_chunk = config.get('vertex_knn_chunk_size', 512)
+            self.grouper = VertexKNNGrouper(k=knn_k, knn_chunk_size=knn_chunk)
+            print(f"Grouper: VertexKNNGrouper (K={knn_k}, chunk={knn_chunk})")
+        else:
+            self.grouper = LocalPatchGrouper(use_global_coordinates=predict_offset)
+            print("Grouper: LocalPatchGrouper (scan_knn)")
         
         # Optional extra scan feature
         self.use_scan_normal = config.get('use_scan_normal', False)
@@ -35,7 +51,23 @@ class Stage2Pipeline(nn.Module):
         encoder_type = config.get('encoder_type', 'standard')
         print(f"Encoder Type Selected: {encoder_type}")
         
-        if encoder_type == 'cross_attention':
+        if encoder_type in ('pt_sa_attentive', 'pt_sa_max'):
+            pooling = 'attentive' if encoder_type == 'pt_sa_attentive' else 'max'
+            hidden_dims = config.get('enc_hidden_dim', [64])
+            if isinstance(hidden_dims, int):
+                hidden_dims = [hidden_dims]
+            self.encoder = PTSAEncoder(
+                input_dim=enc_input_dim,
+                hidden_dims=hidden_dims,
+                sa_dim=config.get('pt_sa_dim', 128),
+                num_heads=config.get('pt_sa_num_heads', 4),
+                num_sa_layers=config.get('pt_sa_num_layers', 1),
+                feature_dim=config.get('feature_dim', 512),
+                pooling_type=pooling,
+                use_ffn=config.get('pt_sa_use_ffn', True),
+                pe_num_frequencies=config.get('pt_sa_pe_frequencies', 4),
+            )
+        elif encoder_type == 'cross_attention':
             self.encoder = CrossAttentionFeatureEncoder(
                 input_dim=enc_input_dim,
                 hidden_dim=config.get('enc_hidden_dim', 64),
@@ -141,62 +173,76 @@ class Stage2Pipeline(nn.Module):
             setattr(_sub, "_profile_do_log", do_log)
 
         # 1. Grouping
+        B, V, _ = base_verts.shape
         t0 = prof_start() if do_log else None
-        local_points, cluster_idx = self.grouper(base_verts, base_normals, scan_points)
+
+        is_vertex_knn = self.grouper_type == 'vertex_knn'
+        is_pt_sa = isinstance(self.encoder, PTSAEncoder)
+
+        if is_vertex_knn:
+            grouped_features, local_coords = self.grouper(
+                base_verts, base_normals, scan_points,
+                scan_normals=scan_normals if self.use_scan_normal else None,
+            )
+        else:
+            local_points, cluster_idx = self.grouper(base_verts, base_normals, scan_points)
         if do_log:
             prof_split(True, t0, "grouper", "pipe")
 
         # 2. Encoding
-        # 注意: num_verts 需要处理 batch 内可能不一致的情况，通常取 max
-        B, V, _ = base_verts.shape
-        encoder_input = local_points
-        if self.use_scan_normal and scan_normals is not None:
-            encoder_input = torch.cat([encoder_input, scan_normals], dim=-1)
-        
-        # Check if encoder supports attention return
+        diagnostics = None
+        attention_scores, global_cluster_idx = None, None
+
         is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
         is_cross_attn = isinstance(self.encoder, CrossAttentionFeatureEncoder)
-        diagnostics = None
-        
-        if return_attention and is_attentive:
+
+        if is_pt_sa:
             t0 = prof_start() if do_log else None
-            result = self.encoder(
-                encoder_input, cluster_idx, num_verts=V, 
-                return_attention=True, return_diagnostics=return_diagnostics
-            )
+            vertex_features, trans_feat = self.encoder(grouped_features, local_coords)
             if do_log:
                 prof_split(True, t0, "encoder(total)", "pipe")
-            if return_diagnostics:
-                vertex_features, trans_feat, attention_scores, global_cluster_idx, diagnostics = result
-            else:
-                vertex_features, trans_feat, attention_scores, global_cluster_idx = result
-        elif return_diagnostics and is_attentive:
-            t0 = prof_start() if do_log else None
-            vertex_features, trans_feat, diagnostics = self.encoder(
-                encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
-            )
-            if do_log:
-                prof_split(True, t0, "encoder(total)", "pipe")
-            attention_scores, global_cluster_idx = None, None
-        elif is_cross_attn:
-            t0 = prof_start() if do_log else None
-            if return_diagnostics:
+        else:
+            # Legacy scatter-based encoders
+            encoder_input = local_points
+            if self.use_scan_normal and scan_normals is not None:
+                encoder_input = torch.cat([encoder_input, scan_normals], dim=-1)
+
+            if return_attention and is_attentive:
+                t0 = prof_start() if do_log else None
+                result = self.encoder(
+                    encoder_input, cluster_idx, num_verts=V,
+                    return_attention=True, return_diagnostics=return_diagnostics
+                )
+                if do_log:
+                    prof_split(True, t0, "encoder(total)", "pipe")
+                if return_diagnostics:
+                    vertex_features, trans_feat, attention_scores, global_cluster_idx, diagnostics = result
+                else:
+                    vertex_features, trans_feat, attention_scores, global_cluster_idx = result
+            elif return_diagnostics and is_attentive:
+                t0 = prof_start() if do_log else None
                 vertex_features, trans_feat, diagnostics = self.encoder(
                     encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
                 )
+                if do_log:
+                    prof_split(True, t0, "encoder(total)", "pipe")
+            elif is_cross_attn:
+                t0 = prof_start() if do_log else None
+                if return_diagnostics:
+                    vertex_features, trans_feat, diagnostics = self.encoder(
+                        encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
+                    )
+                else:
+                    vertex_features, trans_feat = self.encoder(
+                        encoder_input, cluster_idx, num_verts=V
+                    )
+                if do_log:
+                    prof_split(True, t0, "encoder(total)", "pipe")
             else:
-                vertex_features, trans_feat = self.encoder(
-                    encoder_input, cluster_idx, num_verts=V
-                )
-            if do_log:
-                prof_split(True, t0, "encoder(total)", "pipe")
-            attention_scores, global_cluster_idx = None, None
-        else:
-            t0 = prof_start() if do_log else None
-            vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
-            if do_log:
-                prof_split(True, t0, "encoder(total)", "pipe")
-            attention_scores, global_cluster_idx = None, None
+                t0 = prof_start() if do_log else None
+                vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
+                if do_log:
+                    prof_split(True, t0, "encoder(total)", "pipe")
 
         # 2.5 VAE Bottleneck (optional)
         kl_loss = None

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch3d.ops import knn_points
+from pytorch3d.ops import knn_points, knn_gather
 
 def compute_rotation_matrices(normals: torch.Tensor) -> torch.Tensor:
     """
@@ -258,3 +258,81 @@ class LocalPatchGrouperPadding(nn.Module):
         local_points_grouped = torch.stack(grouped_points, dim=0)
         grouped_idx = torch.stack(grouped_idx, dim=0)
         return local_points_grouped, grouped_idx
+
+
+def _chunked_topk_knn(
+    query: torch.Tensor,
+    database: torch.Tensor,
+    k: int,
+    chunk_size: int = 128,
+) -> torch.Tensor:
+    """Fast KNN via chunked cdist + topk (avoids full-sort bottleneck).
+
+    Args:
+        query:    (B, V, 3)
+        database: (B, P, 3)
+        k:        number of nearest neighbours
+        chunk_size: vertices per chunk (controls peak VRAM of distance matrix)
+
+    Returns:
+        idx: (B, V, K)  indices into database dim-1
+    """
+    B, V, _ = query.shape
+    idx_chunks = []
+    for start in range(0, V, chunk_size):
+        q = query[:, start : start + chunk_size]          # (B, cs, 3)
+        d = torch.cdist(q, database)                      # (B, cs, P)
+        _, topk_idx = d.topk(k, dim=-1, largest=False)    # (B, cs, K)
+        idx_chunks.append(topk_idx)
+    return torch.cat(idx_chunks, dim=1)                    # (B, V, K)
+
+
+class VertexKNNGrouper(nn.Module):
+    """
+    Vertex-side KNN grouper: each base mesh vertex gathers its K nearest
+    scan points, producing fixed-size neighborhoods suitable for batched
+    self-attention (no scatter / variable-length padding needed).
+
+    Uses chunked cdist + topk instead of PyTorch3D knn_points to avoid
+    the expensive full-sort on the P dimension.
+    """
+    def __init__(self, k: int = 512, knn_chunk_size: int = 128):
+        super().__init__()
+        self.k = k
+        self.knn_chunk_size = knn_chunk_size
+
+    def forward(
+        self,
+        base_verts: torch.Tensor,
+        base_normals: torch.Tensor,
+        scan_points: torch.Tensor,
+        scan_normals: torch.Tensor | None = None,
+    ):
+        """
+        Args:
+            base_verts:   (B, V, 3)
+            base_normals: (B, V, 3)  – unused here but kept for API compat
+            scan_points:  (B, P, 3)
+            scan_normals: (B, P, 3) or None
+
+        Returns:
+            grouped_features: (B, V, K, D)  D=3 or 6
+            local_coords:     (B, V, K, 3)  relative positions (for PE)
+        """
+        K = min(self.k, scan_points.shape[1])
+
+        with torch.no_grad():
+            idx = _chunked_topk_knn(
+                base_verts, scan_points, K, chunk_size=self.knn_chunk_size
+            )  # (B, V, K)
+
+        gathered_pts = knn_gather(scan_points, idx)            # (B, V, K, 3)
+        local_coords = gathered_pts - base_verts.unsqueeze(2)
+
+        if scan_normals is not None:
+            gathered_normals = knn_gather(scan_normals, idx)   # (B, V, K, 3)
+            grouped_features = torch.cat([local_coords, gathered_normals], dim=-1)
+        else:
+            grouped_features = local_coords
+
+        return grouped_features, local_coords
