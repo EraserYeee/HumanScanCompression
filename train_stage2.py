@@ -4,6 +4,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
 import yaml
 import time
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -44,6 +45,56 @@ except ImportError:
         return torch.tensor(0.0, device=args[0].device if args else 'cuda')
 
 
+@torch.no_grad()
+def _build_uniform_adjacency(faces, num_verts, device):
+    """Build unique directed-edge lists and per-vertex degree from triangle faces."""
+    idx = faces.long()
+    rows = torch.cat([idx[:, 0], idx[:, 1], idx[:, 1], idx[:, 2], idx[:, 0], idx[:, 2]])
+    cols = torch.cat([idx[:, 1], idx[:, 0], idx[:, 2], idx[:, 1], idx[:, 2], idx[:, 0]])
+    adj = torch.sparse_coo_tensor(
+        torch.stack([rows, cols]),
+        torch.ones(rows.shape[0], device=device),
+        size=(num_verts, num_verts),
+    ).coalesce()
+    src = adj.indices()[0]
+    dst = adj.indices()[1]
+    degree = torch.zeros(num_verts, device=device)
+    degree.index_add_(0, src, torch.ones(src.shape[0], device=device))
+    degree.clamp_(min=1.0)
+    return src, dst, degree
+
+
+def compute_uniform_laplacian_l1(verts, faces):
+    """
+    NGF-style uniform Laplacian regularization (L1).
+    L = mean |v_i - mean(v_j for j in N(i))|
+    
+    Args:
+        verts: (V, 3) vertex positions (requires grad)
+        faces: (F, 3) triangle indices (long)
+    """
+    V = verts.shape[0]
+    src, dst, degree = _build_uniform_adjacency(faces, V, verts.device)
+    neighbor_sum = torch.zeros(V, 3, device=verts.device)
+    neighbor_sum.scatter_add_(0, src.unsqueeze(1).expand(-1, 3), verts[dst])
+    smoothed = neighbor_sum / degree.unsqueeze(1)
+    return (verts - smoothed).abs().mean()
+
+
+def compute_normal_spatial_gradients(pred_normal, gt_normal):
+    """
+    Same finite differences as in the geo normal loss (on L2-normalized normals).
+    pred_dx / pred_dy: ∂N/∂x, ∂N/∂y with shapes (B, H, W-1, 3) and (B, H-1, W, 3).
+    """
+    pred_n = F.normalize(pred_normal, dim=-1, p=2)
+    gt_n = F.normalize(gt_normal, dim=-1, p=2)
+    pred_dx = pred_n[:, :, 1:, :] - pred_n[:, :, :-1, :]
+    gt_dx = gt_n[:, :, 1:, :] - gt_n[:, :, :-1, :]
+    pred_dy = pred_n[:, 1:, :, :] - pred_n[:, :-1, :, :]
+    gt_dy = gt_n[:, 1:, :, :] - gt_n[:, :-1, :, :]
+    return pred_n, gt_n, pred_dx, pred_dy, gt_dx, gt_dy
+
+
 def compute_normal_loss_geo(pred_normal, gt_normal, mask):
     """
     Geometric normal loss from:
@@ -59,8 +110,7 @@ def compute_normal_loss_geo(pred_normal, gt_normal, mask):
     mask_f = mask.float()
     num_valid = mask_f.sum().clamp(min=1.0)
 
-    pred_n = torch.nn.functional.normalize(pred_normal, dim=-1, p=2)
-    gt_n = torch.nn.functional.normalize(gt_normal, dim=-1, p=2)
+    pred_n, gt_n, pred_dx, pred_dy, gt_dx, gt_dy = compute_normal_spatial_gradients(pred_normal, gt_normal)
 
     # Term 1: cosine distance
     cos_dist = (1.0 - (pred_n * gt_n).sum(dim=-1, keepdim=True)) * mask_f
@@ -71,12 +121,6 @@ def compute_normal_loss_geo(pred_normal, gt_normal, mask):
     loss_l2 = l2_dist.sum() / num_valid
 
     # Term 3: spatial gradient consistency (finite differences along H and W)
-    # dx: difference along W; dy: difference along H
-    pred_dx = pred_n[:, :, 1:, :] - pred_n[:, :, :-1, :]
-    gt_dx = gt_n[:, :, 1:, :] - gt_n[:, :, :-1, :]
-    pred_dy = pred_n[:, 1:, :, :] - pred_n[:, :-1, :, :]
-    gt_dy = gt_n[:, 1:, :, :] - gt_n[:, :-1, :, :]
-
     mask_dx = mask_f[:, :, 1:, :] * mask_f[:, :, :-1, :]
     mask_dy = mask_f[:, 1:, :, :] * mask_f[:, :-1, :, :]
 
@@ -85,6 +129,39 @@ def compute_normal_loss_geo(pred_normal, gt_normal, mask):
     loss_grad = grad_loss_x + grad_loss_y
 
     return loss_cos + loss_l2 + loss_grad
+
+
+def _pad_normal_dx_to_hw(dx):
+    """(B, H, W-1, 3) -> (B, H, W, 3), pad missing column with 0."""
+    return F.pad(dx, (0, 0, 0, 1, 0, 0, 0, 0))
+
+
+def _pad_normal_dy_to_hw(dy):
+    """(B, H-1, W, 3) -> (B, H, W, 3), pad missing row with 0."""
+    return F.pad(dy, (0, 0, 0, 0, 0, 1, 0, 0))
+
+
+def _numpy_signed_vec_to_rgb(arr):
+    """arr (H, W, 3): robust [-1,1] RGB viz (per-image max-abs scale)."""
+    m = float(np.abs(arr).max())
+    if m < 1e-8:
+        return np.zeros((*arr.shape[:2], 3), dtype=np.uint8)
+    scaled = np.clip(arr / m, -1.0, 1.0)
+    return ((scaled + 1.0) * 0.5 * 255.0).astype(np.uint8)
+
+
+def _numpy_grayscale_from_mag(dx_hw, dy_hw):
+    """dx_hw, dy_hw: (H, W, 3) numpy — same as grad magnitude sqrt(||dx||^2+||dy||^2)."""
+    mag = np.sqrt((dx_hw ** 2).sum(-1) + (dy_hw ** 2).sum(-1))
+    m = float(mag.max()) + 1e-8
+    return np.clip(mag / m * 255.0, 0, 255).astype(np.uint8)
+
+
+def _numpy_err_heatmap(err_vec):
+    """err_vec (H, W, 3): L2 norm per pixel, grayscale heatmap."""
+    e = np.sqrt((err_vec ** 2).sum(-1))
+    m = float(e.max()) + 1e-8
+    return np.clip(e / m * 255.0, 0, 255).astype(np.uint8)
 
 
 def load_config(config_path):
@@ -126,10 +203,12 @@ def debug_export_meshes(base_v, base_f, fine_v, fine_f, gt_v, gt_f, step, batch_
     
     print(f"[Debug] Exported meshes to {save_dir}")
 
-def debug_export_images(pred_img, gt_img, step, batch_idx, tag=""):
+def debug_export_images(pred_img, gt_img, step, batch_idx, tag="", include_geo_grad=False):
     """
     导出渲染结果用于调试
     pred_img, gt_img: (K, H, W, 3) or (B*K, H, W, 3)
+    include_geo_grad: 当 normal_loss_type=geo 时，额外导出与 loss 一致的 ∂N/∂x、∂N/∂y（归一化后差分）
+        及梯度幅值、pred−gt 梯度误差热力图（与 compute_normal_spatial_gradients 一致）。
     """
     save_dir = f"/mnt/lab/data/yeruisi/data/compression/debug_train_images/step_{step:04d}_b{batch_idx}"
     os.makedirs(save_dir, exist_ok=True)
@@ -153,6 +232,43 @@ def debug_export_images(pred_img, gt_img, step, batch_idx, tag=""):
             g = (g + 1.0) * 0.5 * 255.0
             g = np.clip(g, 0, 255).astype(np.uint8)
             Image.fromarray(g).save(os.path.join(save_dir, f"gt_view_{i}_{tag}.png"))
+
+        if include_geo_grad and gt_img is not None:
+            with torch.no_grad():
+                pi = pred_img[i : i + 1]
+                gi = gt_img[i : i + 1]
+                _, _, pdx, pdy, gdx, gdy = compute_normal_spatial_gradients(pi, gi)
+                pdx_hw = _pad_normal_dx_to_hw(pdx)[0].detach().cpu().numpy()
+                pdy_hw = _pad_normal_dy_to_hw(pdy)[0].detach().cpu().numpy()
+                gdx_hw = _pad_normal_dx_to_hw(gdx)[0].detach().cpu().numpy()
+                gdy_hw = _pad_normal_dy_to_hw(gdy)[0].detach().cpu().numpy()
+
+            Image.fromarray(_numpy_signed_vec_to_rgb(pdx_hw)).save(
+                os.path.join(save_dir, f"pred_dndx_view_{i}_{tag}.png")
+            )
+            Image.fromarray(_numpy_signed_vec_to_rgb(pdy_hw)).save(
+                os.path.join(save_dir, f"pred_dndy_view_{i}_{tag}.png")
+            )
+            Image.fromarray(_numpy_signed_vec_to_rgb(gdx_hw)).save(
+                os.path.join(save_dir, f"gt_dndx_view_{i}_{tag}.png")
+            )
+            Image.fromarray(_numpy_signed_vec_to_rgb(gdy_hw)).save(
+                os.path.join(save_dir, f"gt_dndy_view_{i}_{tag}.png")
+            )
+            Image.fromarray(_numpy_grayscale_from_mag(pdx_hw, pdy_hw)).save(
+                os.path.join(save_dir, f"pred_gradmag_view_{i}_{tag}.png")
+            )
+            Image.fromarray(_numpy_grayscale_from_mag(gdx_hw, gdy_hw)).save(
+                os.path.join(save_dir, f"gt_gradmag_view_{i}_{tag}.png")
+            )
+            err_x = pdx_hw - gdx_hw
+            err_y = pdy_hw - gdy_hw
+            Image.fromarray(_numpy_err_heatmap(err_x)).save(
+                os.path.join(save_dir, f"err_grad_dx_view_{i}_{tag}.png")
+            )
+            Image.fromarray(_numpy_err_heatmap(err_y)).save(
+                os.path.join(save_dir, f"err_grad_dy_view_{i}_{tag}.png")
+            )
             
     print(f"[Debug] Exported rendered images to {save_dir}")
 
@@ -345,6 +461,19 @@ def train(config, args):
                 loss_disp_batch = 0
                 loss_mat_batch = 0 # Matrix regularization loss
                 loss_kl_batch = 0  # VAE KL divergence loss
+                # Weighted loss terms for wandb (0 when weight or signal is off)
+                term_depth_batch = 0.0
+                term_mask_batch = 0.0
+                term_normal_l1_batch = 0.0
+                term_normal_ssim_batch = 0.0
+                term_normal_geo_batch = 0.0
+                term_chamfer_batch = 0.0
+                term_laplacian_batch = 0.0
+                term_disp_batch = 0.0
+                term_mat_batch = 0.0
+                term_kl_batch = 0.0
+                render_full_batch = 0.0
+                render_nd_l1_batch = 0.0
                 
                 # Diagnostics: attentive (full) or cross_attention (CA residual stats)
                 _et = config['model'].get('encoder_type', 'standard')
@@ -447,6 +576,9 @@ def train(config, args):
                 
                     # Non-render losses (computed once, shared across view chunks)
                     loss_lap = torch.tensor(0.0, device=accelerator.device)
+                    w_lap = config['loss'].get('w_laplacian', 0.0)
+                    if w_lap > 0:
+                        loss_lap = compute_uniform_laplacian_l1(f_verts[0], f_faces)
                     loss_disp = torch.tensor(0.0, device=accelerator.device)
                     loss_mat = torch.tensor(0.0, device=accelerator.device)
                     loss_kl = torch.tensor(0.0, device=accelerator.device)
@@ -474,6 +606,13 @@ def train(config, args):
                         w_mat * loss_mat +
                         loss_kl
                     )
+                    w_disp_cfg = config['loss'].get('w_disp', 0.0)
+                    w_lap_cfg = config['loss'].get('w_laplacian', 0.0)
+                    term_chamfer_batch += (w_chamfer * loss_chamfer).item()
+                    term_laplacian_batch += (w_lap_cfg * loss_lap).item()
+                    term_disp_batch += (w_disp_cfg * loss_disp).item()
+                    term_mat_batch += (w_mat * loss_mat).item()
+                    term_kl_batch += loss_kl.item()
                 
                     # View-chunked rendering with per-chunk backward to save VRAM.
                     # Each chunk renders view_chunk_size views, computes render loss,
@@ -485,10 +624,17 @@ def train(config, args):
                 
                     if should_render and num_view_chunks > 0:
                         w_depth_l1 = config['loss'].get('w_depth_l1', 10.0)
+                        w_mask = config['loss'].get('w_mask', 0.0)
                         normal_loss_type = config['loss'].get('normal_loss_type', 'l1')
                         w_normal_l1 = config['loss'].get('w_normal_l1', 4.0)
                         w_normal_ssim = config['loss'].get('w_normal_ssim', 0.5)
                         w_normal_geo = config['loss'].get('w_normal_geo', 4.0)
+                        sum_w_depth = 0.0
+                        sum_w_mask = 0.0
+                        sum_w_nl1 = 0.0
+                        sum_w_ssim = 0.0
+                        sum_w_geo = 0.0
+                        sum_render_nd_l1 = 0.0
                     
                         for vc in range(num_view_chunks):
                             is_last_chunk = (vc == num_view_chunks - 1)
@@ -498,37 +644,48 @@ def train(config, args):
                             )
                         
                             loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
-                        
-                            if w_depth_l1 > 0 and pred_depth is not None and gt_depth is not None:
+                            loss_mask = torch.tensor(0.0, device=accelerator.device)
+                            loss_normal_l1_val = torch.tensor(0.0, device=accelerator.device)
+
+                            if pred_depth is not None and gt_depth is not None:
                                 depth_mask = (pred_depth.abs() > 1e-6) & (gt_depth.abs() > 1e-6)
                                 if depth_mask.any():
                                     loss_depth_l1 = torch.nn.functional.l1_loss(
                                         pred_depth[depth_mask], gt_depth[depth_mask]
                                     )
+                                pred_occ = (pred_depth.abs() > 1e-6).float()
+                                gt_occ = (gt_depth.abs() > 1e-6).float()
+                                loss_mask = F.l1_loss(pred_occ, gt_occ)
+
+                            if pred_img is not None and gt_img is not None:
+                                normal_mask_or = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | (
+                                    gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6
+                                )
+                                if normal_mask_or.any():
+                                    pred_masked = pred_img * normal_mask_or
+                                    gt_masked = gt_img * normal_mask_or
+                                    loss_normal_l1_val = torch.nn.functional.l1_loss(
+                                        pred_masked, gt_masked
+                                    )
                         
                             if normal_loss_type == 'geo':
                                 loss_normal_geo_val = torch.tensor(0.0, device=accelerator.device)
                                 if w_normal_geo > 0 and pred_img is not None and gt_img is not None:
-                                    normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
-                                                 (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
-                                    if normal_mask.any():
-                                        loss_normal_geo_val = compute_normal_loss_geo(pred_img, gt_img, normal_mask)
+                                    pred_fg = pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6
+                                    gt_fg = gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6
+                                    normal_mask_and = pred_fg & gt_fg
+                                    if normal_mask_and.any():
+                                        loss_normal_geo_val = compute_normal_loss_geo(
+                                            pred_img, gt_img, normal_mask_and
+                                        )
+                                loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
                                 chunk_render_loss = (
                                     w_depth_l1 * loss_depth_l1 +
-                                    w_normal_geo * loss_normal_geo_val
+                                    w_normal_geo * loss_normal_geo_val +
+                                    w_mask * loss_mask
                                 )
                             else:
-                                loss_normal_l1_val = torch.tensor(0.0, device=accelerator.device)
                                 loss_normal_ssim = torch.tensor(0.0, device=accelerator.device)
-
-                                if w_normal_l1 > 0 and pred_img is not None and gt_img is not None:
-                                    normal_mask = (pred_img.abs().sum(dim=-1, keepdim=True) > 1e-6) | \
-                                                 (gt_img.abs().sum(dim=-1, keepdim=True) > 1e-6)
-                                    if normal_mask.any():
-                                        pred_masked = pred_img * normal_mask
-                                        gt_masked = gt_img * normal_mask
-                                        loss_normal_l1_val = torch.nn.functional.l1_loss(pred_masked, gt_masked)
-
                                 if w_normal_ssim > 0 and HAS_SSIM and pred_img is not None and gt_img is not None:
                                     pred_normal_norm = (pred_img + 1.0) * 0.5
                                     gt_normal_norm = (gt_img + 1.0) * 0.5
@@ -540,8 +697,22 @@ def train(config, args):
                                 chunk_render_loss = (
                                     w_depth_l1 * loss_depth_l1 +
                                     w_normal_l1 * loss_normal_l1_val +
-                                    w_normal_ssim * loss_normal_ssim
+                                    w_normal_ssim * loss_normal_ssim +
+                                    w_mask * loss_mask
                                 )
+
+                            w_depth_e = (w_depth_l1 * loss_depth_l1).item()
+                            w_mask_e = (w_mask * loss_mask).item()
+                            w_nl1_e = (w_normal_l1 * loss_normal_l1_val).item()
+                            sum_w_depth += w_depth_e
+                            sum_w_mask += w_mask_e
+                            sum_w_nl1 += w_nl1_e
+                            sum_render_nd_l1 += w_depth_e + w_nl1_e
+                            if normal_loss_type == 'geo':
+                                w_geo_e = (w_normal_geo * loss_normal_geo_val).item()
+                                sum_w_geo += w_geo_e
+                            else:
+                                sum_w_ssim += (w_normal_ssim * loss_normal_ssim).item()
                         
                             loss_render_accum += chunk_render_loss.item()
                         
@@ -554,10 +725,25 @@ def train(config, args):
                             accelerator.backward(chunk_loss, retain_graph=not is_last_chunk)
                         
                             if vc == 0 and should_export and accelerator.is_main_process:
-                                debug_export_images(pred_img, gt_img, step, b, tag=f"step_{step}")
+                                debug_export_images(
+                                    pred_img,
+                                    gt_img,
+                                    step,
+                                    b,
+                                    tag=f"step_{step}",
+                                    include_geo_grad=(normal_loss_type == 'geo'),
+                                )
                         
                             del pred_img, gt_img, pred_depth, gt_depth
                             del chunk_render_loss, chunk_loss
+                        nch = float(num_view_chunks)
+                        term_depth_batch += sum_w_depth / nch
+                        term_mask_batch += sum_w_mask / nch
+                        term_normal_l1_batch += sum_w_nl1 / nch
+                        term_normal_ssim_batch += sum_w_ssim / nch
+                        term_normal_geo_batch += sum_w_geo / nch
+                        render_full_batch += loss_render_accum / nch
+                        render_nd_l1_batch += sum_render_nd_l1 / nch
                     else:
                         loss_nr_scaled = loss_non_render / len(base_verts_list)
                         accelerator.backward(loss_nr_scaled)
@@ -611,14 +797,26 @@ def train(config, args):
                 
                 # Log
                 if step % config['train']['log_interval'] == 0:
+                    bl = max(batch_len, 1)
                     log_dict = {
                         "loss/total": total_loss_batch,
-                        "loss/render": loss_render_batch / batch_len,
-                        "loss/chamfer": loss_chamfer_batch / batch_len,
-                        "loss/laplacian": loss_lap_batch / batch_len,
-                        "loss/disp": loss_disp_batch / batch_len,
-                        "loss/mat": loss_mat_batch / batch_len,
-                        "loss/kl": loss_kl_batch / batch_len,
+                        "loss/render": render_nd_l1_batch / bl,
+                        "loss/render_full": render_full_batch / bl,
+                        "loss/term_depth_l1": term_depth_batch / bl,
+                        "loss/term_mask": term_mask_batch / bl,
+                        "loss/term_normal_l1": term_normal_l1_batch / bl,
+                        "loss/term_normal_ssim": term_normal_ssim_batch / bl,
+                        "loss/term_normal_geo": term_normal_geo_batch / bl,
+                        "loss/term_chamfer": term_chamfer_batch / bl,
+                        "loss/term_laplacian": term_laplacian_batch / bl,
+                        "loss/term_disp": term_disp_batch / bl,
+                        "loss/term_mat": term_mat_batch / bl,
+                        "loss/term_kl": term_kl_batch / bl,
+                        "loss/chamfer_raw": loss_chamfer_batch / bl,
+                        "loss/laplacian_raw": loss_lap_batch / bl,
+                        "loss/disp_raw": loss_disp_batch / bl,
+                        "loss/mat_raw": loss_mat_batch / bl,
+                        "loss/kl_raw": loss_kl_batch / bl,
                         "lr": optimizer.param_groups[0]['lr'],
                         "epoch": epoch
                     }
@@ -705,12 +903,14 @@ def train(config, args):
                     # Clear diagnostics list after logging
                     diagnostics_list.clear()
                     
+                _bl = max(batch_len, 1)
                 pbar.set_postfix({
                     'loss': f"{total_loss_batch:.4f}",
-                    'cham': f"{loss_chamfer_batch / batch_len:.4f}",
-                    'rend': f"{loss_render_batch / batch_len:.4f}",
-                    'mat': f"{loss_mat_batch / batch_len:.4f}",
-                    'kl': f"{loss_kl_batch / batch_len:.6f}"
+                    'cham': f"{loss_chamfer_batch / _bl:.4f}",
+                    'rend': f"{render_nd_l1_batch / _bl:.4f}",
+                    'rfull': f"{render_full_batch / _bl:.4f}",
+                    'mat': f"{loss_mat_batch / _bl:.4f}",
+                    'kl': f"{loss_kl_batch / _bl:.6f}"
                 })
                 
                 # Release batch-level tensors after logging
