@@ -29,7 +29,10 @@ class ScanToMeshDataset(Dataset):
                  backend='open3d', debug_export=False,
                  preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False, 
                  preload_ram=False, lmdb_path=None, use_scan_normal=False,
-                 dataset_type='human'):
+                 dataset_type='human',
+                 sharp_edge_sampling=False,
+                 sharp_edge_angle_threshold=10.0,
+                 sharp_edge_ratio=0.5):
         """
         Args:
             data_root: 预处理数据目录
@@ -42,6 +45,9 @@ class ScanToMeshDataset(Dataset):
             preload_ram: 是否将所有数据预加载到内存中 (解决 IO 瓶颈)
             lmdb_path: 预打包的 LMDB 数据库路径 (推荐使用)
             dataset_type: 'human' (默认) 或 'thingi10k'
+            sharp_edge_sampling: 是否启用 sharp edge biased sampling
+            sharp_edge_angle_threshold: 二面角阈值 (度)
+            sharp_edge_ratio: sharp 点占总采样点的比例
         """
         self.data_root = data_root
         self.split = split
@@ -55,7 +61,13 @@ class ScanToMeshDataset(Dataset):
         self.preload_ram = preload_ram
         self.lmdb_path = lmdb_path
         self.use_scan_normal = use_scan_normal
+        self.sharp_edge_sampling = sharp_edge_sampling
+        self.sharp_edge_angle_threshold = sharp_edge_angle_threshold
+        self.sharp_edge_ratio = sharp_edge_ratio
         self.lmdb_env = None
+        
+        if self.sharp_edge_sampling:
+            print(f"[Dataset] Sharp edge sampling ENABLED: threshold={self.sharp_edge_angle_threshold}°, ratio={self.sharp_edge_ratio}")
         
         if self.backend == 'pyfqmr' and not _HAS_PYFQMR:
             print("[Warning] pyfqmr not found, falling back to open3d")
@@ -178,6 +190,106 @@ class ScanToMeshDataset(Dataset):
                                 
                 print(f"[Dataset] Preload complete. GT Cache: {len(self.gt_cache)}, Base Cache: {len(self.base_cache)}")
 
+    @staticmethod
+    def _sample_on_sharp_edges(mesh, sharp_edge_verts, sharp_face_pairs, target_num):
+        """Interpolate points along sharp edges (Dora-style)."""
+        verts = mesh.vertices
+        face_normals = mesh.face_normals
+        E = len(sharp_edge_verts)
+        if E == 0:
+            return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32)
+
+        unique_idx = np.unique(sharp_edge_verts.ravel())
+        known_pts = verts[unique_idx]
+        known_nrm = mesh.vertex_normals[unique_idx]
+        num_known = len(known_pts)
+        num_need = max(target_num - num_known, 0)
+
+        n1 = face_normals[sharp_face_pairs[:, 0]]
+        n2 = face_normals[sharp_face_pairs[:, 1]]
+        edge_normals = 0.5 * (n1 + n2)
+        edge_normals /= np.linalg.norm(edge_normals, axis=1, keepdims=True).clip(1e-8)
+
+        start = verts[sharp_edge_verts[:, 0]]
+        end = verts[sharp_edge_verts[:, 1]]
+
+        interp_pts, interp_nrm = [], []
+        if num_need > 0:
+            if num_need >= E:
+                per_edge = num_need // E
+                for j in range(1, per_edge + 1):
+                    t = j / (per_edge + 1)
+                    interp_pts.append((1 - t) * start + t * end)
+                    interp_nrm.append(edge_normals)
+                remainder = num_need % E
+            else:
+                remainder = num_need
+
+            if remainder > 0:
+                rng = np.random.default_rng()
+                sel = rng.choice(E, remainder, replace=(remainder > E))
+                t = np.random.rand(remainder, 1).astype(np.float32)
+                interp_pts.append((1 - t) * start[sel] + t * end[sel])
+                interp_nrm.append(edge_normals[sel])
+
+        all_pts = [known_pts] + interp_pts
+        all_nrm = [known_nrm] + interp_nrm
+        all_pts = np.concatenate(all_pts, axis=0).astype(np.float32)
+        all_nrm = np.concatenate(all_nrm, axis=0).astype(np.float32)
+
+        if len(all_pts) > target_num:
+            idx = np.random.choice(len(all_pts), target_num, replace=False)
+            all_pts, all_nrm = all_pts[idx], all_nrm[idx]
+        return all_pts, all_nrm
+
+    def _sample_scan_points(self, tm_mesh):
+        """Sample scan points: sharp-edge biased or uniform."""
+        if not self.sharp_edge_sampling:
+            pts, fid = trimesh.sample.sample_surface(tm_mesh, self.point_num)
+            pts = pts.astype(np.float32)
+            nrm = tm_mesh.face_normals[fid].astype(np.float32) if self.use_scan_normal else None
+            return pts, nrm
+
+        threshold_rad = np.deg2rad(self.sharp_edge_angle_threshold)
+        angles = tm_mesh.face_adjacency_angles
+        mask = angles >= threshold_rad
+
+        num_sharp_target = int(self.point_num * self.sharp_edge_ratio)
+        num_uniform_target = self.point_num - num_sharp_target
+
+        sharp_edge_verts = tm_mesh.face_adjacency_edges[mask]
+        sharp_face_pairs = tm_mesh.face_adjacency[mask]
+        num_sharp_edges = len(sharp_edge_verts)
+
+        min_sharp_fallback = 0.05
+        if num_sharp_edges == 0 or num_sharp_target == 0:
+            pts, fid = trimesh.sample.sample_surface(tm_mesh, self.point_num)
+            pts = pts.astype(np.float32)
+            nrm = tm_mesh.face_normals[fid].astype(np.float32) if self.use_scan_normal else None
+            return pts, nrm
+
+        sharp_pts, sharp_nrm = self._sample_on_sharp_edges(
+            tm_mesh, sharp_edge_verts, sharp_face_pairs, num_sharp_target
+        )
+
+        if len(sharp_pts) < num_sharp_target * min_sharp_fallback:
+            pts, fid = trimesh.sample.sample_surface(tm_mesh, self.point_num)
+            pts = pts.astype(np.float32)
+            nrm = tm_mesh.face_normals[fid].astype(np.float32) if self.use_scan_normal else None
+            return pts, nrm
+
+        num_uniform_target = self.point_num - len(sharp_pts)
+        uni_pts, fid = trimesh.sample.sample_surface(tm_mesh, num_uniform_target)
+        uni_pts = uni_pts.astype(np.float32)
+
+        scan_points = np.concatenate([sharp_pts, uni_pts], axis=0)
+        if self.use_scan_normal:
+            uni_nrm = tm_mesh.face_normals[fid].astype(np.float32)
+            scan_normals = np.concatenate([sharp_nrm, uni_nrm], axis=0)
+        else:
+            scan_normals = None
+        return scan_points, scan_normals
+
     def __len__(self):
         return len(self.file_list)
 
@@ -223,14 +335,9 @@ class ScanToMeshDataset(Dataset):
         
         t1 = time.time()
         
-        # 1. Online Sampling (Trimesh is good for sampling)
+        # 1. Online Sampling
         tm_mesh = trimesh.Trimesh(vertices=gt_verts_np, faces=gt_faces_np, process=False)
-        scan_points, sampled_face_idx = trimesh.sample.sample_surface(tm_mesh, self.point_num)
-        scan_points = scan_points.astype(np.float32)
-        scan_normals = None
-        if self.use_scan_normal:
-            # Use source face normals from fine mesh (not estimated from sampled point cloud).
-            scan_normals = tm_mesh.face_normals[sampled_face_idx].astype(np.float32)
+        scan_points, scan_normals = self._sample_scan_points(tm_mesh)
         t2 = time.time()
         
         base_verts_np = None

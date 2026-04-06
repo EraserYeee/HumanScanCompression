@@ -88,10 +88,13 @@ def train(config, args):
         backend=config['data'].get('simplification_backend', 'open3d'),
         preprocessed_base_mesh_dir=config['data'].get('preprocessed_base_mesh_dir', None),
         use_preprocess_base_mesh=config['data'].get('use_preprocess_base_mesh', False),
-        preload_ram=config['data'].get('preload_ram', False), # Controlled by config
+        preload_ram=config['data'].get('preload_ram', False),
         lmdb_path=config['data'].get('lmdb_path', None),
         use_scan_normal=config['model'].get('use_scan_normal', False),
-        dataset_type=dataset_type
+        dataset_type=dataset_type,
+        sharp_edge_sampling=config['data'].get('sharp_edge_sampling', False),
+        sharp_edge_angle_threshold=config['data'].get('sharp_edge_angle_threshold', 10.0),
+        sharp_edge_ratio=config['data'].get('sharp_edge_ratio', 0.5),
     )
     
     dataloader = DataLoader(
