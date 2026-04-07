@@ -30,14 +30,12 @@ class FaceTriangleDecoder(nn.Module):
     """Decoder that operates in per-face triangle parametric coordinates.
 
     For each subdivision point (u_sub, v_sub) inside a face:
-      1.  MLP predicts (Du, Dv, Dd) from [face_feat, PE(u_sub, v_sub)]
-      2.  World displacement = Du*e1 + Dv*e2 + Dd*n
+      1.  MLP predicts (D1, D2, D3) from [face_feat, PE(u_sub, v_sub)]
+      2.  ortho_frame=True  → disp = D1*e1_hat + D2*e2_perp + D3*n  (orthonormal)
+          ortho_frame=False → disp = D1*e1    + D2*e2      + D3*n  (parametric)
       3.  Base position = v0 + u_sub*e1 + v_sub*e2
       4.  Shared seam points are averaged via scatter_mean on world displacements
       5.  Fine position = base position + stitched displacement
-
-    This is significantly cheaper than SumOfFeatureDecoder because it uses a
-    single MLP instead of 3 feature-map MLPs + 1 predictor MLP.
     """
 
     def __init__(
@@ -49,12 +47,14 @@ class FaceTriangleDecoder(nn.Module):
         posenc_mode: int = 1,
         init_mode: str = "near_zero",
         predict_offset: bool = False,
+        ortho_frame: bool = True,
     ):
         super().__init__()
         self.fflevels = levels
         self.rate = rate
         self.posenc_mode = posenc_mode
         self.init_mode = init_mode
+        self.ortho_frame = ortho_frame
         self.subdivision = BarycentricSubdivision()
 
         if isinstance(hidden_dim, int):
@@ -106,6 +106,13 @@ class FaceTriangleDecoder(nn.Module):
 
         v0, e1, e2, n, _, _, _, _ = _compute_face_basis(base_verts, base_faces)
 
+        if self.ortho_frame:
+            disp_b1 = F.normalize(e1, dim=-1)                      # (B, F, 3)
+            disp_b2 = torch.cross(n, disp_b1, dim=-1)              # ⊥ n and e1_hat
+        else:
+            disp_b1 = e1
+            disp_b2 = e2
+
         uv_A, uv_B = self.subdivision.sample_uniform_bary(
             self.rate, num_triangles=num_faces
         )
@@ -115,8 +122,7 @@ class FaceTriangleDecoder(nn.Module):
         u_param = uv_B.view(num_faces, K)                          # (F, K)
         v_param = (1.0 - uv_A - uv_B).view(num_faces, K)          # (F, K)
 
-        # Base subdivision positions in world coords
-        # (B, F, K, 3) = (B,F,1,3) + u*(B,F,1,3) + v*(B,F,1,3)
+        # Base subdivision positions in world coords (uses original e1, e2)
         u_3d = u_param.view(1, num_faces, K, 1)                    # broadcast with B
         v_3d = v_param.view(1, num_faces, K, 1)
         lp = (
@@ -137,16 +143,15 @@ class FaceTriangleDecoder(nn.Module):
         mlp_in = torch.cat([feat_exp, pos_enc], dim=-1)             # (B, F, K, D+pe)
 
         out = self.mlp(mlp_in.reshape(-1, mlp_in.shape[-1]))
-        out = out.view(B_batch, num_faces, K, 3)                    # (Du, Dv, Dd)
+        out = out.view(B_batch, num_faces, K, 3)                    # (D1, D2, D3)
 
-        # Convert triangle-space displacement to world-space
-        du = out[..., 0:1]                                          # (B, F, K, 1)
-        dv = out[..., 1:2]
-        dd = out[..., 2:3]
+        d1 = out[..., 0:1]                                         # (B, F, K, 1)
+        d2 = out[..., 1:2]
+        d3 = out[..., 2:3]
         disp_world = (
-            du * e1.unsqueeze(2)
-            + dv * e2.unsqueeze(2)
-            + dd * n.unsqueeze(2)
+            d1 * disp_b1.unsqueeze(2)
+            + d2 * disp_b2.unsqueeze(2)
+            + d3 * n.unsqueeze(2)
         )                                                           # (B, F, K, 3)
 
         disp_flat = disp_world.view(B_batch, -1, 3)                # (B, F*K, 3)

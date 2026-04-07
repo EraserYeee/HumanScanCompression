@@ -97,13 +97,15 @@ def train(config, args):
         sharp_edge_ratio=config['data'].get('sharp_edge_ratio', 0.5),
     )
     
+    nw = config['data']['num_workers']
     dataloader = DataLoader(
         dataset, 
         batch_size=config['data']['batch_size'], 
         shuffle=True, 
-        num_workers=config['data']['num_workers'],
+        num_workers=nw,
         collate_fn=stage2_collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=nw > 0,
     )
 
     # 3. Setup Model

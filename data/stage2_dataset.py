@@ -454,18 +454,12 @@ class ScanToMeshDataset(Dataset):
                     base_faces_np = base_data['base_faces'].numpy().astype(np.int64)
                     
                     # --- Normalization for Base Mesh (Apply SAME transform as GT) ---
-                    # Note: We must use the SAME center and scale as calculated from GT
                     base_verts_np = (base_verts_np - center) / scale
                     # --------------------------------------------------------------
                     
-                    # Compute normals for base mesh (Trimesh or Open3D)
-                    # Preprocessed file might not have normals saved.
-                    # Let's compute them on the fly.
-                    mesh_o3d = o3d.geometry.TriangleMesh()
-                    mesh_o3d.vertices = o3d.utility.Vector3dVector(base_verts_np)
-                    mesh_o3d.triangles = o3d.utility.Vector3iVector(base_faces_np.astype(np.int32))
-                    mesh_o3d.compute_vertex_normals()
-                    base_normals_np = np.asarray(mesh_o3d.vertex_normals, dtype=np.float32)
+                    # Pure-numpy vertex normals (avoids heavy Open3D object creation in workers)
+                    fn, _ = _face_normals_and_areas(base_verts_np, base_faces_np)
+                    base_normals_np = _vertex_normals(base_verts_np, base_faces_np, fn)
                     
                 except Exception as e:
                     print(f"[Error] Failed to load base mesh {base_pt_full_path}: {e}. Fallback to online.")

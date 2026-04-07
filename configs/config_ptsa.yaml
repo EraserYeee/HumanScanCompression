@@ -11,7 +11,7 @@ data:
   processed_dir: /mnt/lab/data/yeruisi/data/compression/dataset_preload2
   simplification_backend: pyfqmr
   use_preprocess_base_mesh: true
-  sharp_edge_sampling: true         # 启用 sharp edge biased sampling
+  sharp_edge_sampling: false         # 启用 sharp edge biased sampling
   sharp_edge_angle_threshold: 10.0   # 二面角阈值 (度)
   sharp_edge_ratio: 0.5              # sharp 点占总采样点的比例
 device: cuda
@@ -34,6 +34,7 @@ loss:
 model:
   # --- Encoding mode ---
   encoding_mode: face          # 'vertex' (default) or 'face' (triangle coordinate system)
+  face_ortho_frame: false       # true: orthonormal {e1_hat, e2_perp, n} frame for displacement false: raw parametric {e1, e2, n} frame (needs strong encoder)
 
   # --- Grouper ---
   grouper_type: vertex_knn      # 'scan_knn' (original) or 'vertex_knn'
