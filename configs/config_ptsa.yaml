@@ -11,11 +11,11 @@ data:
   processed_dir: /mnt/lab/data/yeruisi/data/compression/dataset_preload2
   simplification_backend: pyfqmr
   use_preprocess_base_mesh: true
-  sharp_edge_sampling: false         # 启用 sharp edge biased sampling
+  sharp_edge_sampling: true         # 启用 sharp edge biased sampling
   sharp_edge_angle_threshold: 10.0   # 二面角阈值 (度)
   sharp_edge_ratio: 0.5              # sharp 点占总采样点的比例
 device: cuda
-experiment_name: stage2_ptsa_attentive_k512
+experiment_name: stage2_ptsa_attentive_facecoding
 loss:
   use_chamfer: false
   w_chamfer: 100.0
@@ -32,10 +32,13 @@ loss:
   vae_beta: 0.001
   vae_warmup_epochs: 0
 model:
+  # --- Encoding mode ---
+  encoding_mode: face          # 'vertex' (default) or 'face' (triangle coordinate system)
+
   # --- Grouper ---
   grouper_type: vertex_knn      # 'scan_knn' (original) or 'vertex_knn'
   vertex_knn_k: 512             # points per vertex neighbourhood
-  vertex_knn_chunk_size: 2048
+  vertex_knn_chunk_size: 512
 
   # --- Encoder (PT Self-Attention) ---
   # 'pt_sa_attentive' (SA + attention pooling) or 'pt_sa_max' (SA + max pooling)
@@ -68,7 +71,7 @@ render:
   dist_multiplier: 0.4
   image_size: 512
   use_mixed_views: false
-  views_per_sample: 30
+  views_per_sample: 6
   view_chunk_size: 3
 seed: 42
 enable_attention_diagnostics: false

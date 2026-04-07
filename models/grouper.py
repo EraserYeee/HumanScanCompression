@@ -336,3 +336,175 @@ class VertexKNNGrouper(nn.Module):
             grouped_features = local_coords
 
         return grouped_features, local_coords
+
+
+def _compute_face_basis(base_verts, base_faces):
+    """Compute per-face edge vectors, unit normal, and Gram matrix elements.
+
+    Args:
+        base_verts: (B, V, 3)
+        base_faces: (B, F, 3) LongTensor
+
+    Returns:
+        v0:  (B, F, 3)
+        e1:  (B, F, 3)  v1 - v0
+        e2:  (B, F, 3)  v2 - v0
+        n:   (B, F, 3)  unit face normal
+        g11: (B, F, 1)
+        g12: (B, F, 1)
+        g22: (B, F, 1)
+        det: (B, F, 1)  clamped determinant of Gram matrix
+    """
+    B, V, _ = base_verts.shape
+    batch_offset = (torch.arange(B, device=base_verts.device) * V).view(-1, 1, 1)
+    flat_idx = (base_faces + batch_offset).view(-1)                 # (B*F*3,)
+    flat_verts = base_verts.view(-1, 3)                             # (B*V, 3)
+    face_verts = flat_verts[flat_idx].view(B, -1, 3, 3)            # (B, F, 3, 3)
+
+    v0 = face_verts[:, :, 0, :]                                    # (B, F, 3)
+    v1 = face_verts[:, :, 1, :]
+    v2 = face_verts[:, :, 2, :]
+
+    e1 = v1 - v0                                                   # (B, F, 3)
+    e2 = v2 - v0
+
+    cross = torch.cross(e1, e2, dim=-1)                            # (B, F, 3)
+    n = F.normalize(cross, dim=-1)
+
+    g11 = (e1 * e1).sum(-1, keepdim=True)                          # (B, F, 1)
+    g12 = (e1 * e2).sum(-1, keepdim=True)
+    g22 = (e2 * e2).sum(-1, keepdim=True)
+    det = (g11 * g22 - g12 * g12).clamp(min=1e-8)
+
+    return v0, e1, e2, n, g11, g12, g22, det
+
+
+def _world_to_tri(delta, e1, e2, n, g11, g12, g22, det):
+    """Convert world-space displacement vectors to triangle parametric coords.
+
+    Args:
+        delta: (B, F, K, 3)  world-space offsets relative to v0
+        e1, e2, n: (B, F, 3) face basis vectors
+        g11, g12, g22, det: (B, F, 1)  Gram matrix elements
+
+    Returns:
+        tri_coords: (B, F, K, 3)  [u, v, d] in triangle parameter space
+    """
+    # dot products: (B, F, 1, 3) * (B, F, K, 3) -> sum -> (B, F, K)
+    d1 = (delta * e1.unsqueeze(2)).sum(-1)
+    d2 = (delta * e2.unsqueeze(2)).sum(-1)
+    d_val = (delta * n.unsqueeze(2)).sum(-1)
+
+    # g11 etc. are (B, F, 1), d1 etc. are (B, F, K) -> broadcasts to (B, F, K)
+    u_val = (g22 * d1 - g12 * d2) / det
+    v_val = (g11 * d2 - g12 * d1) / det
+
+    return torch.stack([u_val, v_val, d_val], dim=-1)
+
+
+class FaceKNNGrouper(nn.Module):
+    """Face-side KNN grouper: each base mesh face gathers K nearest scan
+    points via its centroid, then encodes them in triangle parametric
+    coordinates (u, v, d).
+
+    Output shape is identical to VertexKNNGrouper so downstream encoders
+    work without modification.
+    """
+    def __init__(self, k: int = 512, knn_chunk_size: int = 128):
+        super().__init__()
+        self.k = k
+        self.knn_chunk_size = knn_chunk_size
+
+    def forward(
+        self,
+        base_verts: torch.Tensor,
+        base_faces: torch.Tensor,
+        scan_points: torch.Tensor,
+        scan_normals: torch.Tensor | None = None,
+    ):
+        """
+        Args:
+            base_verts:   (B, V, 3)
+            base_faces:   (B, F, 3) LongTensor
+            scan_points:  (B, P, 3)
+            scan_normals: (B, P, 3) or None
+
+        Returns:
+            grouped_features: (B, F, K, D)  D=3 or 6
+            local_coords:     (B, F, K, 3)  triangle parametric coords
+        """
+        v0, e1, e2, n, g11, g12, g22, det = _compute_face_basis(base_verts, base_faces)
+
+        centroids = v0 + (e1 + e2) / 3.0                           # (B, F, 3)
+
+        K = min(self.k, scan_points.shape[1])
+        with torch.no_grad():
+            idx = _chunked_topk_knn(
+                centroids, scan_points, K, chunk_size=self.knn_chunk_size
+            )                                                       # (B, F, K)
+
+        gathered_pts = knn_gather(scan_points, idx)                 # (B, F, K, 3)
+        delta = gathered_pts - v0.unsqueeze(2)                      # relative to v0
+        local_coords = _world_to_tri(delta, e1, e2, n, g11, g12, g22, det)
+
+        if scan_normals is not None:
+            gathered_normals = knn_gather(scan_normals, idx)         # (B, F, K, 3)
+            delta_normals = gathered_normals - n.unsqueeze(2)
+            grouped_features = torch.cat([local_coords, delta_normals], dim=-1)
+        else:
+            grouped_features = local_coords
+
+        return grouped_features, local_coords
+
+
+class FaceLocalGrouper(nn.Module):
+    """Scan-side KNN=1 grouper using face centroids instead of vertices.
+    Each scan point is assigned to its nearest face and encoded in that
+    face's triangle parametric coordinates.
+
+    Output API matches LocalPatchGrouper: (local_points, cluster_idx)
+    where cluster_idx indexes into *faces* (0..F-1).
+    """
+    def forward(
+        self,
+        base_verts: torch.Tensor,
+        base_faces: torch.Tensor,
+        scan_points: torch.Tensor,
+        scan_normals: torch.Tensor | None = None,
+    ):
+        """
+        Returns:
+            local_points: (B, P, 3)  triangle parametric coords
+            cluster_idx:  (B, P)     face index per scan point
+        """
+        v0, e1, e2, n, g11, g12, g22, det = _compute_face_basis(base_verts, base_faces)
+
+        centroids = v0 + (e1 + e2) / 3.0                           # (B, F, 3)
+
+        knn_res = knn_points(scan_points, centroids, K=1)
+        cluster_idx = knn_res.idx.squeeze(-1)                       # (B, P)
+
+        B, P, _ = scan_points.shape
+        bi = torch.arange(B, device=scan_points.device).view(-1, 1).expand(-1, P)
+
+        face_v0 = v0[bi, cluster_idx]                               # (B, P, 3)
+        face_e1 = e1[bi, cluster_idx]
+        face_e2 = e2[bi, cluster_idx]
+        face_n  = n[bi, cluster_idx]
+        face_g11 = g11[bi, cluster_idx]
+        face_g12 = g12[bi, cluster_idx]
+        face_g22 = g22[bi, cluster_idx]
+        face_det = det[bi, cluster_idx]
+
+        delta = scan_points - face_v0                               # (B, P, 3)
+
+        d1 = (delta * face_e1).sum(-1)
+        d2 = (delta * face_e2).sum(-1)
+        d_val = (delta * face_n).sum(-1)
+
+        u_val = (face_g22.squeeze(-1) * d1 - face_g12.squeeze(-1) * d2) / face_det.squeeze(-1)
+        v_val = (face_g11.squeeze(-1) * d2 - face_g12.squeeze(-1) * d1) / face_det.squeeze(-1)
+
+        local_points = torch.stack([u_val, v_val, d_val], dim=-1)  # (B, P, 3)
+
+        return local_points, cluster_idx

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .grouper import LocalPatchGrouper, VertexKNNGrouper
+from .grouper import LocalPatchGrouper, VertexKNNGrouper, FaceKNNGrouper, FaceLocalGrouper
 from .timing_hooks import prof_start, prof_split, profile_is_rank0
 from .encoder import (
     LocalFeatureEncoder,
@@ -11,6 +11,7 @@ from .encoder import (
 )
 from .decoder import NeuralSubdivisionDecoder
 from .decoder_sumof_feature import SumOfFeatureDecoder
+from .decoder_face_triangle import FaceTriangleDecoder
 
 class Stage2Pipeline(nn.Module):
     """
@@ -26,18 +27,32 @@ class Stage2Pipeline(nn.Module):
         # Check if we should predict global offset (xyz) instead of scalar displacement
         predict_offset = config.get('predict_offset', False)
         
+        # === Encoding Mode ===
+        encoding_mode = config.get('encoding_mode', 'vertex')
+        self.encoding_mode = encoding_mode
+
         # === Grouper Selection ===
         grouper_type = config.get('grouper_type', 'scan_knn')
         self.grouper_type = grouper_type
 
-        if grouper_type == 'vertex_knn':
-            knn_k = config.get('vertex_knn_k', 512)
-            knn_chunk = config.get('vertex_knn_chunk_size', 512)
-            self.grouper = VertexKNNGrouper(k=knn_k, knn_chunk_size=knn_chunk)
-            print(f"Grouper: VertexKNNGrouper (K={knn_k}, chunk={knn_chunk})")
+        if encoding_mode == 'face':
+            if grouper_type == 'vertex_knn':
+                knn_k = config.get('vertex_knn_k', 512)
+                knn_chunk = config.get('vertex_knn_chunk_size', 512)
+                self.grouper = FaceKNNGrouper(k=knn_k, knn_chunk_size=knn_chunk)
+                print(f"Grouper: FaceKNNGrouper (K={knn_k}, chunk={knn_chunk})")
+            else:
+                self.grouper = FaceLocalGrouper()
+                print("Grouper: FaceLocalGrouper (scan_knn, face centroids)")
         else:
-            self.grouper = LocalPatchGrouper(use_global_coordinates=predict_offset)
-            print("Grouper: LocalPatchGrouper (scan_knn)")
+            if grouper_type == 'vertex_knn':
+                knn_k = config.get('vertex_knn_k', 512)
+                knn_chunk = config.get('vertex_knn_chunk_size', 512)
+                self.grouper = VertexKNNGrouper(k=knn_k, knn_chunk_size=knn_chunk)
+                print(f"Grouper: VertexKNNGrouper (K={knn_k}, chunk={knn_chunk})")
+            else:
+                self.grouper = LocalPatchGrouper(use_global_coordinates=predict_offset)
+                print("Grouper: LocalPatchGrouper (scan_knn)")
         
         # Optional extra scan feature
         self.use_scan_normal = config.get('use_scan_normal', False)
@@ -113,33 +128,41 @@ class Stage2Pipeline(nn.Module):
         decoder_type = config.get('decoder_type', 'standard')
         print("Pipeline config received: ", config.keys())
         print("Model config keys:", config.keys())
-        print(f"Decoder Type Selected: {decoder_type}")
+        print(f"Decoder Type Selected: {decoder_type}, encoding_mode: {encoding_mode}")
         
         # Initialization mode: 'near_zero' or 'random'
         init_mode = config.get('init_mode', 'near_zero')
         
-        common_kwargs = {
-            'feature_dim': decoder_feature_dim,
-            'levels': config.get('subdivision_levels', 8),
-            'rate': config.get('subdivision_rate', 4),
-            'predict_offset': predict_offset,
-            'posenc_mode': config.get('posenc_mode', 1),
-            'init_mode': init_mode
-        }
-        
-        if decoder_type == 'sum_of_feature':
-            self.decoder = SumOfFeatureDecoder(
+        if encoding_mode == 'face':
+            self.decoder = FaceTriangleDecoder(
+                feature_dim=decoder_feature_dim,
                 hidden_dim=config.get('dec_hidden_dim', 64),
-                **common_kwargs
+                levels=config.get('subdivision_levels', 8),
+                rate=config.get('subdivision_rate', 4),
+                posenc_mode=config.get('posenc_mode', 1),
+                init_mode=init_mode,
             )
+            print("Decoder: FaceTriangleDecoder")
         else:
-            # 0: Local Pos (raw) + Normal (raw)。
-            # 1: PosEnc(Local Pos) + Normal (raw)。
-            # 2: PosEnc(Local Pos) + PosEnc(Normal)。
-            self.decoder = NeuralSubdivisionDecoder(
+            common_kwargs = {
+                'feature_dim': decoder_feature_dim,
+                'levels': config.get('subdivision_levels', 8),
+                'rate': config.get('subdivision_rate', 4),
+                'predict_offset': predict_offset,
+                'posenc_mode': config.get('posenc_mode', 1),
+                'init_mode': init_mode
+            }
+            
+            if decoder_type == 'sum_of_feature':
+                self.decoder = SumOfFeatureDecoder(
                     hidden_dim=config.get('dec_hidden_dim', 64),
                     **common_kwargs
-            )
+                )
+            else:
+                self.decoder = NeuralSubdivisionDecoder(
+                        hidden_dim=config.get('dec_hidden_dim', 64),
+                        **common_kwargs
+                )
 
     def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None, 
                 return_attention=False, return_diagnostics=False):
@@ -174,12 +197,25 @@ class Stage2Pipeline(nn.Module):
 
         # 1. Grouping
         B, V, _ = base_verts.shape
+        _, num_faces_dim, _ = base_faces.shape
         t0 = prof_start() if do_log else None
 
+        is_face = self.encoding_mode == 'face'
         is_vertex_knn = self.grouper_type == 'vertex_knn'
         is_pt_sa = isinstance(self.encoder, PTSAEncoder)
 
-        if is_vertex_knn:
+        if is_face:
+            if is_vertex_knn:
+                grouped_features, local_coords = self.grouper(
+                    base_verts, base_faces, scan_points,
+                    scan_normals=scan_normals if self.use_scan_normal else None,
+                )
+            else:
+                local_points, cluster_idx = self.grouper(
+                    base_verts, base_faces, scan_points,
+                    scan_normals=scan_normals if self.use_scan_normal else None,
+                )
+        elif is_vertex_knn:
             grouped_features, local_coords = self.grouper(
                 base_verts, base_normals, scan_points,
                 scan_normals=scan_normals if self.use_scan_normal else None,
@@ -196,6 +232,8 @@ class Stage2Pipeline(nn.Module):
         is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
         is_cross_attn = isinstance(self.encoder, CrossAttentionFeatureEncoder)
 
+        num_anchors = num_faces_dim if is_face else V
+
         if is_pt_sa:
             t0 = prof_start() if do_log else None
             vertex_features, trans_feat = self.encoder(grouped_features, local_coords)
@@ -210,7 +248,7 @@ class Stage2Pipeline(nn.Module):
             if return_attention and is_attentive:
                 t0 = prof_start() if do_log else None
                 result = self.encoder(
-                    encoder_input, cluster_idx, num_verts=V,
+                    encoder_input, cluster_idx, num_verts=num_anchors,
                     return_attention=True, return_diagnostics=return_diagnostics
                 )
                 if do_log:
@@ -222,7 +260,7 @@ class Stage2Pipeline(nn.Module):
             elif return_diagnostics and is_attentive:
                 t0 = prof_start() if do_log else None
                 vertex_features, trans_feat, diagnostics = self.encoder(
-                    encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
+                    encoder_input, cluster_idx, num_verts=num_anchors, return_diagnostics=True
                 )
                 if do_log:
                     prof_split(True, t0, "encoder(total)", "pipe")
@@ -230,17 +268,17 @@ class Stage2Pipeline(nn.Module):
                 t0 = prof_start() if do_log else None
                 if return_diagnostics:
                     vertex_features, trans_feat, diagnostics = self.encoder(
-                        encoder_input, cluster_idx, num_verts=V, return_diagnostics=True
+                        encoder_input, cluster_idx, num_verts=num_anchors, return_diagnostics=True
                     )
                 else:
                     vertex_features, trans_feat = self.encoder(
-                        encoder_input, cluster_idx, num_verts=V
+                        encoder_input, cluster_idx, num_verts=num_anchors
                     )
                 if do_log:
                     prof_split(True, t0, "encoder(total)", "pipe")
             else:
                 t0 = prof_start() if do_log else None
-                vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=V)
+                vertex_features, trans_feat = self.encoder(encoder_input, cluster_idx, num_verts=num_anchors)
                 if do_log:
                     prof_split(True, t0, "encoder(total)", "pipe")
 

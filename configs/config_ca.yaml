@@ -35,6 +35,7 @@ loss:
   vae_beta: 0.001         # KL divergence weight
   vae_warmup_epochs: 0   # linearly ramp beta from 0 to vae_beta over this many epochs
 model:
+  encoding_mode: vertex          # 'vertex' (default) or 'face' (triangle coordinate system)
   dec_hidden_dim: [256,128,64 ]
   decoder_type: sum_of_feature
   enc_hidden_dim: [128, 256]
