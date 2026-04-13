@@ -27,3 +27,6 @@ nohup.out
 *.png
 *.log
 *.obj
+*.md
+./LightweightMR/
+./PoNQ/

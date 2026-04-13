@@ -134,7 +134,7 @@ class Stage2Pipeline(nn.Module):
         init_mode = config.get('init_mode', 'near_zero')
         
         if encoding_mode == 'face':
-            ortho = config.get('face_ortho_frame', True)
+            ortho = config.get('face_ortho_frame', False)
             self.decoder = FaceTriangleDecoder(
                 feature_dim=decoder_feature_dim,
                 hidden_dim=config.get('dec_hidden_dim', 64),

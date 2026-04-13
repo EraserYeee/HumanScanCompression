@@ -38,15 +38,15 @@ model:
 
   # --- Grouper ---
   grouper_type: vertex_knn      # 'scan_knn' (original) or 'vertex_knn'
-  vertex_knn_k: 768             # points per vertex neighbourhood
-  vertex_knn_chunk_size: 768
+  vertex_knn_k: 512             # points per vertex neighbourhood
+  vertex_knn_chunk_size: 512
 
   # --- Encoder (PT Self-Attention) ---
   # 'pt_sa_attentive' (SA + attention pooling) or 'pt_sa_max' (SA + max pooling)
   encoder_type: pt_sa_attentive
   enc_hidden_dim: [64]          # light MLP before SA (fewer layers than original)
   pt_sa_dim: 128                # self-attention hidden dimension
-  pt_sa_num_heads: 1
+  pt_sa_num_heads: 4
   pt_sa_num_layers: 1
   pt_sa_use_ffn: true
   pt_sa_pe_frequencies: 4       # sinusoidal PE frequency bands
@@ -63,7 +63,7 @@ model:
   decoder_type: sum_of_feature
   dec_hidden_dim: [256, 128, 64]
   subdivision_levels: 8
-  subdivision_rate: 14
+  subdivision_rate: 16
 
   # --- VAE (disabled) ---
   use_vae: false
@@ -73,7 +73,7 @@ render:
   image_size: 512
   use_mixed_views: false
   views_per_sample: 6
-  view_chunk_size: 3
+  view_chunk_size: 2
 seed: 42
 enable_attention_diagnostics: false
 train:
