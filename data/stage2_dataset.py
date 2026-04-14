@@ -92,65 +92,6 @@ def _sample_surface_np(vertices: np.ndarray, faces: np.ndarray,
     pts = ((1.0 - r1) * v0 + r1 * (1.0 - r2) * v1 + r1 * r2 * v2).astype(np.float32)
     return pts, face_normals[fid]
 
-
-def _compute_curvature_np_static(points, normals, knn_k=30, subsample=50000):
-    """Estimate surface curvature from normals (numpy, for data workers).
-
-    Computes on a subsample for speed, then interpolates to full resolution.
-    Adapted from LightweightMR/models/losses.py:78-89 (cal_curvature_with_normal).
-
-    Returns: (P, 1) float32 curvature in [0, 1].
-    """
-    from scipy.spatial import cKDTree
-
-    P = len(points)
-    if P <= knn_k + 1:
-        return np.ones((P, 1), dtype=np.float32) * 0.5
-
-    # Subsample for speed
-    if P > subsample:
-        sub_idx = np.random.choice(P, subsample, replace=False)
-        sub_pts = points[sub_idx]
-        sub_nor = normals[sub_idx]
-    else:
-        sub_idx = np.arange(P)
-        sub_pts = points
-        sub_nor = normals
-
-    # KNN on subsample
-    tree = cKDTree(sub_pts)
-    dists, neigh_idx = tree.query(sub_pts, k=knn_k + 1)  # +1 for self
-    neigh_idx = neigh_idx[:, 1:]  # exclude self
-    dists = dists[:, 1:]
-
-    # Curvature proxy: normal variation
-    neigh_normals = sub_nor[neigh_idx]  # (S, K, 3)
-    cos_sim = np.einsum('ij,ikj->ik', sub_nor, neigh_normals).clip(-1, 1)
-    curvature_raw = 1.0 - cos_sim  # (S, K)
-
-    # Gaussian kernel weighting
-    h = dists.mean(axis=-1, keepdims=True).clip(1e-8)  # (S, 1)
-    g_weight = np.exp(-dists ** 2 / h ** 2)  # (S, K)
-    g_weight = g_weight / g_weight.sum(axis=-1, keepdims=True).clip(1e-8)
-    curvature_sub = (curvature_raw * g_weight).sum(axis=-1, keepdims=True)  # (S, 1)
-
-    # Sigmoid + min-max normalization
-    mean_c = curvature_sub.mean()
-    curvature_sub = 1.0 / (1.0 + np.exp(-(curvature_sub - mean_c)))
-    c_min, c_max = curvature_sub.min(), curvature_sub.max()
-    curvature_sub = (curvature_sub - c_min + 1e-6) / (c_max - c_min + 1e-6)
-
-    # Interpolate to full resolution via nearest neighbor
-    if P > subsample:
-        full_tree = cKDTree(sub_pts)
-        _, nn_idx = full_tree.query(points, k=1)
-        curvature_full = curvature_sub[nn_idx]
-    else:
-        curvature_full = curvature_sub
-
-    return curvature_full.astype(np.float32)
-
-
 class ScanToMeshDataset(Dataset):
     """
     Stage 2 训练数据集 (Online Simplification & Sampling).
@@ -159,18 +100,15 @@ class ScanToMeshDataset(Dataset):
     2. Online: 使用 Open3D 或 PyFQMR 随机简化 GT Mesh 得到 Base Mesh.
     3. Online: 使用 Trimesh 从 GT Mesh 表面采样 Scan Points (320k).
     """
-    def __init__(self, data_root, split='train', point_num=320000,
-                 base_faces_min=2000, base_faces_max=6000,
+    def __init__(self, data_root, split='train', point_num=320000, 
+                 base_faces_min=2000, base_faces_max=6000, 
                  backend='open3d', debug_export=False,
-                 preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False,
+                 preprocessed_base_mesh_dir=None, use_preprocess_base_mesh=False, 
                  preload_ram=False, lmdb_path=None, use_scan_normal=False,
                  dataset_type='human',
                  sharp_edge_sampling=False,
                  sharp_edge_angle_threshold=10.0,
-                 sharp_edge_ratio=0.5,
-                 compute_curvature=False,
-                 curvature_knn=30,
-                 curvature_subsample=50000):
+                 sharp_edge_ratio=0.5):
         """
         Args:
             data_root: 预处理数据目录
@@ -186,9 +124,6 @@ class ScanToMeshDataset(Dataset):
             sharp_edge_sampling: 是否启用 sharp edge biased sampling
             sharp_edge_angle_threshold: 二面角阈值 (度)
             sharp_edge_ratio: sharp 点占总采样点的比例
-            compute_curvature: 是否计算曲率 (用于 Stage 1 curvature-weighted loss)
-            curvature_knn: 曲率计算的 KNN 邻居数
-            curvature_subsample: 先降采样到此数量再计算曲率 (加速)
         """
         self.data_root = data_root
         self.split = split
@@ -205,9 +140,6 @@ class ScanToMeshDataset(Dataset):
         self.sharp_edge_sampling = sharp_edge_sampling
         self.sharp_edge_angle_threshold = sharp_edge_angle_threshold
         self.sharp_edge_ratio = sharp_edge_ratio
-        self.compute_curvature = compute_curvature
-        self.curvature_knn = curvature_knn
-        self.curvature_subsample = curvature_subsample
         self.lmdb_env = None
         
         self._sharp_cache = {}   # idx -> (sharp_edge_verts, sharp_face_pairs)
@@ -383,14 +315,6 @@ class ScanToMeshDataset(Dataset):
             sel = np.random.choice(len(all_pts), target_num, replace=False)
             all_pts, all_nrm = all_pts[sel], all_nrm[sel]
         return all_pts, all_nrm
-
-    def _compute_curvature_np(self, points, normals):
-        """Compute curvature for scan points (for Stage 1 loss)."""
-        return torch.from_numpy(_compute_curvature_np_static(
-            points, normals,
-            knn_k=self.curvature_knn,
-            subsample=self.curvature_subsample,
-        ))  # (P, 1) float32
 
     def _sample_scan_points(self, idx, vertices, faces):
         """Sample scan points: sharp-edge biased or uniform.  Pure numpy + cache."""
@@ -608,13 +532,6 @@ class ScanToMeshDataset(Dataset):
         }
         if self.use_scan_normal and scan_normals is not None:
             result['scan_normals'] = torch.from_numpy(scan_normals)  # (P, 3)
-
-        # Curvature precomputation for Stage 1 curvature-weighted Chamfer loss
-        if self.compute_curvature and scan_normals is not None:
-            result['scan_curvature'] = self._compute_curvature_np(
-                scan_points, scan_normals
-            )
-
         return result
 
 def stage2_collate_fn(batch):
@@ -644,6 +561,4 @@ def stage2_collate_fn(batch):
     }
     if has_scan_normal:
         result['scan_normals'] = scan_normals
-    if 'scan_curvature' in batch[0]:
-        result['scan_curvature'] = torch.stack([item['scan_curvature'] for item in batch])
     return result

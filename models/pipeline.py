@@ -7,6 +7,7 @@ from .encoder import (
     AttentiveLocalFeatureEncoder,
     CrossAttentionFeatureEncoder,
     PTSAEncoder,
+    PTFlashHierarchicalEncoder,
     VAEHead,
 )
 from .decoder import NeuralSubdivisionDecoder
@@ -82,6 +83,18 @@ class Stage2Pipeline(nn.Module):
                 use_ffn=config.get('pt_sa_use_ffn', True),
                 pe_num_frequencies=config.get('pt_sa_pe_frequencies', 4),
             )
+        elif encoder_type == 'pt_hier_flash':
+            hidden_dims = config.get('enc_hidden_dim', [64])
+            if isinstance(hidden_dims, int):
+                hidden_dims = [hidden_dims]
+            self.encoder = PTFlashHierarchicalEncoder(
+                input_dim=enc_input_dim,
+                hidden_dims=hidden_dims,
+                sa_dim=config.get('pt_sa_dim', 128),
+                num_heads=config.get('pt_sa_num_heads', 4),
+                feature_dim=config.get('feature_dim', 512),
+                pe_num_frequencies=config.get('pt_sa_pe_frequencies', 4),
+            )
         elif encoder_type == 'cross_attention':
             self.encoder = CrossAttentionFeatureEncoder(
                 input_dim=enc_input_dim,
@@ -135,6 +148,7 @@ class Stage2Pipeline(nn.Module):
         
         if encoding_mode == 'face':
             ortho = config.get('face_ortho_frame', False)
+            stitch_gc = config.get('face_stitch_grad_compensate', True)
             self.decoder = FaceTriangleDecoder(
                 feature_dim=decoder_feature_dim,
                 hidden_dim=config.get('dec_hidden_dim', 64),
@@ -143,8 +157,11 @@ class Stage2Pipeline(nn.Module):
                 posenc_mode=config.get('posenc_mode', 1),
                 init_mode=init_mode,
                 ortho_frame=ortho,
+                stitch_grad_compensate=stitch_gc,
             )
-            print(f"Decoder: FaceTriangleDecoder (ortho_frame={ortho})")
+            print(
+                f"Decoder: FaceTriangleDecoder (ortho_frame={ortho}, stitch_grad_compensate={stitch_gc})"
+            )
         else:
             common_kwargs = {
                 'feature_dim': decoder_feature_dim,
@@ -204,7 +221,7 @@ class Stage2Pipeline(nn.Module):
 
         is_face = self.encoding_mode == 'face'
         is_vertex_knn = self.grouper_type == 'vertex_knn'
-        is_pt_sa = isinstance(self.encoder, PTSAEncoder)
+        is_pt_sa = isinstance(self.encoder, (PTSAEncoder, PTFlashHierarchicalEncoder))
 
         if is_face:
             if is_vertex_knn:

@@ -590,15 +590,134 @@ class TransformerSABlock(nn.Module):
         return x
 
 
-class PTSAEncoder(nn.Module):
-    """
-    Point Transformer Self-Attention encoder that operates on fixed-size
-    vertex neighbourhoods produced by VertexKNNGrouper.
+def _farthest_point_sample(coords: torch.Tensor, n_sample: int) -> torch.Tensor:
+    """Pure-PyTorch farthest-point sampling (no extra deps).
 
-    Pipeline:
-        grouped_features (B,V,K,D_in) -> light MLP -> sinusoidal PE concat
-        -> N × SA blocks -> pooling (max / attentive) -> projection -> (B,V,feature_dim)
+    Args:
+        coords: (N, S, 3)
+        n_sample: number of points to select
+
+    Returns:
+        idx: (N, n_sample) long
     """
+    N, S, _ = coords.shape
+    device = coords.device
+    idx = torch.zeros(N, n_sample, dtype=torch.long, device=device)
+    dists = torch.full((N, S), 1e10, device=device)
+    farthest = torch.randint(0, S, (N,), device=device)
+    batch_idx = torch.arange(N, device=device)
+    for i in range(n_sample):
+        idx[:, i] = farthest
+        centroid = coords[batch_idx, farthest].unsqueeze(1)       # (N, 1, 3)
+        d = ((coords - centroid) ** 2).sum(-1)                    # (N, S)
+        dists = torch.min(dists, d)
+        farthest = dists.argmax(-1)                               # (N,)
+    return idx
+
+
+def _knn_idx(src: torch.Tensor, query: torch.Tensor, k: int) -> torch.Tensor:
+    """Brute-force KNN: for each query point find k nearest in src.
+
+    Args:
+        src:   (N, S, 3)
+        query: (N, M, 3)
+        k: int
+
+    Returns:
+        idx: (N, M, k) long – indices into src
+    """
+    d = torch.cdist(query, src)                                   # (N, M, S)
+    return d.topk(k, dim=-1, largest=False).indices               # (N, M, k)
+
+
+class VectorAttentionBlock(nn.Module):
+    """Point Transformer v1 vector-attention with relative position MLP."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.pos_mlp = nn.Sequential(nn.Linear(3, dim), nn.ReLU(), nn.Linear(dim, dim))
+        self.attn_mlp = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        neighbors: torch.Tensor,
+        delta_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query:     (N, M, D)     representative points
+            neighbors: (N, M, k, D)  neighbour features
+            delta_pos: (N, M, k, 3)  relative coordinates (nbr - query)
+
+        Returns:
+            out: (N, M, D)
+        """
+        pe = self.pos_mlp(delta_pos)                              # (N, M, k, D)
+
+        q = self.to_q(query).unsqueeze(2)                         # (N, M, 1, D)
+        k = self.to_k(neighbors)                                  # (N, M, k, D)
+        v = self.to_v(neighbors)                                  # (N, M, k, D)
+
+        w = self.attn_mlp(q - k + pe)                             # (N, M, k, D)
+        w = torch.softmax(w, dim=2)                               # softmax over k
+        out = (w * (v + pe)).sum(dim=2)                           # (N, M, D)
+        return self.out_proj(out) + query                         # residual
+
+
+class TransitionDown(nn.Module):
+    """FPS down-sample + KNN + VectorAttention."""
+
+    def __init__(self, dim: int, n_sample: int, k: int = 16):
+        super().__init__()
+        self.n_sample = n_sample
+        self.k = k
+        self.attn = VectorAttentionBlock(dim)
+
+    def forward(
+        self, x: torch.Tensor, coords: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x:      (N, S, D)  point features
+            coords: (N, S, 3)  point coordinates
+
+        Returns:
+            x_down:      (N, n_sample, D)
+            coords_down: (N, n_sample, 3)
+        """
+        with torch.no_grad():
+            fps_idx = _farthest_point_sample(coords, self.n_sample)  # (N, M)
+        N = x.shape[0]
+        bi = torch.arange(N, device=x.device).unsqueeze(1)
+
+        coords_down = coords[bi, fps_idx]                         # (N, M, 3)
+        x_down = x[bi, fps_idx]                                   # (N, M, D)
+
+        with torch.no_grad():
+            knn_idx = _knn_idx(coords, coords_down, self.k)       # (N, M, k)
+        nbr_feat = x[bi.unsqueeze(2), knn_idx]                    # (N, M, k, D)
+        nbr_pos = coords[bi.unsqueeze(2), knn_idx]                # (N, M, k, 3)
+        delta_pos = nbr_pos - coords_down.unsqueeze(2)            # (N, M, k, 3)
+
+        x_down = self.attn(x_down, nbr_feat, delta_pos)           # (N, M, D)
+        return x_down, coords_down
+
+
+class PTSAEncoder(nn.Module):
+    """Hierarchical Point Transformer encoder (PT v1 style).
+
+    Three-stage FPS down-sampling with local vector-attention:
+        512 pts → 128 → 32 → 1  (face feature)
+
+    Internal dimension stays at sa_dim (default 128) throughout;
+    a final linear projects to feature_dim (default 512).
+    """
+
     def __init__(
         self,
         input_dim: int = 6,
@@ -616,10 +735,9 @@ class PTSAEncoder(nn.Module):
             hidden_dims = [64]
         self.sa_dim = sa_dim
         self.feature_dim = feature_dim
-        self.pooling_type = pooling_type
 
-        # --- MLP backbone (per-point, shared) ---
-        layers = []
+        # --- Per-point MLP backbone ---
+        layers: list[nn.Module] = []
         in_d = input_dim
         for h_d in hidden_dims:
             layers.extend([nn.Linear(in_d, h_d), nn.BatchNorm1d(h_d), nn.ReLU()])
@@ -627,23 +745,32 @@ class PTSAEncoder(nn.Module):
         layers.extend([nn.Linear(in_d, sa_dim), nn.BatchNorm1d(sa_dim), nn.ReLU()])
         self.backbone = nn.Sequential(*layers)
 
-        # --- Sinusoidal position encoding + projection ---
-        self.pe = SinusoidalPositionEncoding(num_frequencies=pe_num_frequencies)
-        self.pe_proj = nn.Linear(sa_dim + self.pe.out_dim, sa_dim)
-
-        # --- Transformer SA blocks ---
-        self.sa_layers = nn.ModuleList(
-            [TransformerSABlock(sa_dim, num_heads=num_heads, use_ffn=use_ffn)
-             for _ in range(num_sa_layers)]
-        )
-
-        # --- Pooling head ---
-        if pooling_type == "attentive":
-            self.pool_score = nn.Linear(sa_dim, 1)
-        # (max pooling needs no parameters)
+        # --- Hierarchical TransitionDown stages ---
+        self.td1 = TransitionDown(sa_dim, n_sample=128, k=16)
+        self.td2 = TransitionDown(sa_dim, n_sample=32, k=16)
+        self.final_attn = VectorAttentionBlock(sa_dim)
 
         # --- Output projection ---
         self.out_proj = nn.Linear(sa_dim, feature_dim)
+
+    def _hierarchy_chunk(
+        self, x: torch.Tensor, coords: torch.Tensor
+    ) -> torch.Tensor:
+        """Run td1 → td2 → final_attn on a small chunk of face groups.
+
+        Args:
+            x:      (C, K, sa_dim)
+            coords: (C, K, 3)
+        Returns:
+            pooled: (C, sa_dim)
+        """
+        x, coords = self.td1(x, coords)
+        x, coords = self.td2(x, coords)
+        center = coords.mean(dim=1, keepdim=True)
+        query = x.mean(dim=1, keepdim=True)
+        delta = coords.unsqueeze(1) - center.unsqueeze(2)
+        nbr = x.unsqueeze(1)
+        return self.final_attn(query, nbr, delta).squeeze(1)
 
     def forward(
         self,
@@ -652,41 +779,206 @@ class PTSAEncoder(nn.Module):
     ):
         """
         Args:
-            grouped_features: (B, V, K, D_in) – output of VertexKNNGrouper
-            local_coords:     (B, V, K, 3)    – relative positions for PE
+            grouped_features: (B, V, K, D_in)
+            local_coords:     (B, V, K, 3)
 
         Returns:
             vertex_features: (B, V, feature_dim)
-            trans_feat:      None  (API compatibility with old encoders)
+            trans_feat:      None  (API compat)
         """
         B, V, K, D_in = grouped_features.shape
+        N = B * V
 
-        # --- Per-point MLP ---
-        x = grouped_features.reshape(B * V * K, D_in)
-        x = self.backbone(x)                    # (B*V*K, sa_dim)
-        x = x.reshape(B * V, K, self.sa_dim)
+        # --- Per-point MLP (memory-safe, benefits from large BN batch) ---
+        x = self.backbone(grouped_features.reshape(N * K, D_in))  # (N*K, sa_dim)
+        x = x.reshape(N, K, self.sa_dim)
+        coords = local_coords.reshape(N, K, 3)
 
-        # --- Add sinusoidal PE ---
-        pe = self.pe(local_coords.reshape(B * V, K, 3))  # (B*V, K, pe_dim)
-        x = self.pe_proj(torch.cat([x, pe], dim=-1))      # (B*V, K, sa_dim)
+        # --- Chunked hierarchical attention ---
+        # VectorAttention creates (chunk, 128, 16, D) intermediates;
+        # chunk_size=256 keeps peak VRAM ≈ 1.2 GB instead of 17+ GB.
+        chunk_size = 256
+        if N <= chunk_size:
+            pooled = self._hierarchy_chunk(x, coords)
+        else:
+            parts = []
+            for i in range(0, N, chunk_size):
+                j = min(i + chunk_size, N)
+                parts.append(self._hierarchy_chunk(x[i:j], coords[i:j]))
+            pooled = torch.cat(parts, dim=0)                       # (N, sa_dim)
 
-        # --- Self-attention blocks ---
-        for layer in self.sa_layers:
-            x = layer(x)                         # (B*V, K, sa_dim)
+        # --- Project ---
+        out = self.out_proj(pooled).reshape(B, V, self.feature_dim)
+        return out, None
 
-        # --- Pooling ---
-        if self.pooling_type == "attentive":
-            scores = self.pool_score(x).squeeze(-1)     # (B*V, K)
-            alpha = torch.softmax(scores, dim=-1)       # (B*V, K)
-            pooled = (alpha.unsqueeze(-1) * x).sum(dim=1)  # (B*V, sa_dim)
-        else:  # max
-            pooled = x.max(dim=1).values                # (B*V, sa_dim)
 
-        # --- Project to feature_dim ---
-        vertex_feats = self.out_proj(pooled)             # (B*V, feature_dim)
-        vertex_feats = vertex_feats.reshape(B, V, self.feature_dim)
+class FlashCrossAttnDown(nn.Module):
+    """FPS down-sample + flash cross-attention (query=selected, key/value=ALL source).
 
-        return vertex_feats, None
+    Unlike VectorAttention-based TransitionDown which explicitly gathers
+    (N, M, k, D) neighbor tensors, this uses standard multi-head cross-attention
+    via F.scaled_dot_product_attention (flash-eligible), keeping VRAM O(N·S·H)
+    instead of O(N·M·k·D).
+    """
+
+    def __init__(self, dim: int, n_sample: int, num_heads: int = 4,
+                 pe_num_frequencies: int = 4):
+        super().__init__()
+        self.n_sample = n_sample
+        self.num_heads = num_heads
+        assert dim % num_heads == 0
+        self.head_dim = dim // num_heads
+
+        self.pe = SinusoidalPositionEncoding(pe_num_frequencies)
+        self.pe_proj = nn.Linear(self.pe.out_dim, dim)
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim)
+
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(),
+                                 nn.Linear(dim * 4, dim))
+
+    def forward(
+        self, x: torch.Tensor, coords: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        N, S, D = x.shape
+        H, d = self.num_heads, self.head_dim
+        M = self.n_sample
+
+        with torch.no_grad():
+            fps_idx = _farthest_point_sample(coords, M)
+        bi = torch.arange(N, device=x.device).unsqueeze(1)
+
+        coords_down = coords[bi, fps_idx]
+        x_down = x[bi, fps_idx]
+
+        pe_q = self.pe_proj(self.pe(coords_down))
+        pe_kv = self.pe_proj(self.pe(coords))
+
+        x_normed = self.norm_kv(x)
+        q = self.to_q(self.norm_q(x_down) + pe_q)
+        k = self.to_k(x_normed + pe_kv)
+        v = self.to_v(x_normed)
+
+        q = q.view(N, M, H, d).transpose(1, 2)
+        k = k.view(N, S, H, d).transpose(1, 2)
+        v = v.view(N, S, H, d).transpose(1, 2)
+
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(N, M, D)
+        x_down = self.out_proj(out) + x_down
+
+        x_down = self.ffn(self.norm_ffn(x_down)) + x_down
+        return x_down, coords_down
+
+
+class FlashPoolAttention(nn.Module):
+    """Cross-attend from a mean-query to all points → single pooled feature."""
+
+    def __init__(self, dim: int, num_heads: int = 4, pe_num_frequencies: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        assert dim % num_heads == 0
+        self.head_dim = dim // num_heads
+
+        self.pe = SinusoidalPositionEncoding(pe_num_frequencies)
+        self.pe_proj = nn.Linear(self.pe.out_dim, dim)
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        N, S, D = x.shape
+        H, d = self.num_heads, self.head_dim
+
+        query = x.mean(dim=1, keepdim=True)
+        query_pos = coords.mean(dim=1, keepdim=True)
+
+        pe_q = self.pe_proj(self.pe(query_pos))
+        pe_kv = self.pe_proj(self.pe(coords))
+
+        x_normed = self.norm_kv(x)
+        q = self.to_q(self.norm_q(query) + pe_q).view(N, 1, H, d).transpose(1, 2)
+        k = self.to_k(x_normed + pe_kv).view(N, S, H, d).transpose(1, 2)
+        v = self.to_v(x_normed).view(N, S, H, d).transpose(1, 2)
+
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(N, D)
+        return self.out_proj(out) + query.squeeze(1)
+
+
+class PTFlashHierarchicalEncoder(nn.Module):
+    """Hierarchical encoder: FPS downsampling + flash dot-product cross-attention.
+
+    Same hierarchical structure as PTSAEncoder (512→128→32→1) but replaces
+    VectorAttention with multi-head cross-attention via flash attention:
+      - No explicit (N, M, k, D) neighbor tensors → ~20x less VRAM
+      - Attends to ALL source points per stage (not just k=16) → wider receptive field
+      - No chunking needed
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 6,
+        hidden_dims: list | None = None,
+        sa_dim: int = 128,
+        num_heads: int = 4,
+        num_sa_layers: int = 1,
+        feature_dim: int = 512,
+        pooling_type: str = "attentive",
+        use_ffn: bool = True,
+        pe_num_frequencies: int = 4,
+    ):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [64]
+        self.sa_dim = sa_dim
+        self.feature_dim = feature_dim
+
+        layers: list[nn.Module] = []
+        in_d = input_dim
+        for h_d in hidden_dims:
+            layers.extend([nn.Linear(in_d, h_d), nn.BatchNorm1d(h_d), nn.ReLU()])
+            in_d = h_d
+        layers.extend([nn.Linear(in_d, sa_dim), nn.BatchNorm1d(sa_dim), nn.ReLU()])
+        self.backbone = nn.Sequential(*layers)
+
+        self.td1 = FlashCrossAttnDown(sa_dim, n_sample=128, num_heads=num_heads,
+                                      pe_num_frequencies=pe_num_frequencies)
+        self.td2 = FlashCrossAttnDown(sa_dim, n_sample=32, num_heads=num_heads,
+                                      pe_num_frequencies=pe_num_frequencies)
+        self.pool = FlashPoolAttention(sa_dim, num_heads=num_heads,
+                                       pe_num_frequencies=pe_num_frequencies)
+
+        self.out_proj = nn.Linear(sa_dim, feature_dim)
+
+    def forward(
+        self,
+        grouped_features: torch.Tensor,
+        local_coords: torch.Tensor,
+    ):
+        B, V, K, D_in = grouped_features.shape
+        N = B * V
+
+        x = self.backbone(grouped_features.reshape(N * K, D_in))
+        x = x.reshape(N, K, self.sa_dim)
+        coords = local_coords.reshape(N, K, 3)
+
+        x, coords = self.td1(x, coords)
+        x, coords = self.td2(x, coords)
+        pooled = self.pool(x, coords)
+
+        out = self.out_proj(pooled).reshape(B, V, self.feature_dim)
+        return out, None
 
 
 class VAEHead(nn.Module):

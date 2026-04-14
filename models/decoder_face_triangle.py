@@ -6,6 +6,7 @@ from utils.subdivision import BarycentricSubdivision
 from torch_scatter import scatter_mean
 from .timing_hooks import prof_start, prof_split
 from .grouper import _compute_face_basis
+from .scatter_compensated_stitch import stitch_displacements_compensated
 
 
 def positional_encoding_2d(uv: torch.Tensor, levels: int) -> torch.Tensor:
@@ -34,7 +35,8 @@ class FaceTriangleDecoder(nn.Module):
       2.  ortho_frame=True  → disp = D1*e1_hat + D2*e2_perp + D3*n  (orthonormal)
           ortho_frame=False → disp = D1*e1    + D2*e2      + D3*n  (parametric)
       3.  Base position = v0 + u_sub*e1 + v_sub*e2
-      4.  Shared seam points are averaged via scatter_mean on world displacements
+      4.  Shared seam points: forward = scatter_mean on world displacements;
+          optional backward gradient compensation (see stitch_grad_compensate)
       5.  Fine position = base position + stitched displacement
     """
 
@@ -48,6 +50,7 @@ class FaceTriangleDecoder(nn.Module):
         init_mode: str = "near_zero",
         predict_offset: bool = False,
         ortho_frame: bool = True,
+        stitch_grad_compensate: bool = True,
     ):
         super().__init__()
         self.fflevels = levels
@@ -55,6 +58,7 @@ class FaceTriangleDecoder(nn.Module):
         self.posenc_mode = posenc_mode
         self.init_mode = init_mode
         self.ortho_frame = ortho_frame
+        self.stitch_grad_compensate = stitch_grad_compensate
         self.subdivision = BarycentricSubdivision()
 
         if isinstance(hidden_dim, int):
@@ -161,10 +165,14 @@ class FaceTriangleDecoder(nn.Module):
         merge_idx = self.subdivision.compute_merge_indices(base_faces, self.rate)
 
         disp_all = disp_flat.reshape(-1, 3)                         # (B*F*K, 3)
-        idx_all = merge_idx.view(-1)                                # (B*F*K,)
+        idx_all = merge_idx.reshape(-1).long()                      # (B*F*K,)
 
-        averaged = scatter_mean(disp_all, idx_all, dim=0)
-        disp_stitched = averaged[idx_all].view(B_batch, -1, 3)
+        if self.stitch_grad_compensate:
+            disp_stitched_flat = stitch_displacements_compensated(disp_all, idx_all)
+        else:
+            averaged = scatter_mean(disp_all, idx_all, dim=0)
+            disp_stitched_flat = averaged[idx_all]
+        disp_stitched = disp_stitched_flat.view(B_batch, -1, 3)
 
         if do_log:
             t0 = prof_split(do_log, t0, "face_tri_mlp_stitch", "dec")

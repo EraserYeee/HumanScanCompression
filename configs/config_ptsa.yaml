@@ -34,25 +34,26 @@ loss:
 model:
   # --- Encoding mode ---
   encoding_mode: face          # 'vertex' (default) or 'face' (triangle coordinate system)
-  face_ortho_frame: false       # true: orthonormal {e1_hat, e2_perp, n} frame for displacement false: raw parametric {e1, e2, n} frame (needs strong encoder)
+  face_ortho_frame: true       # true: orthonormal {e1_hat, e2_perp, n} frame for displacement false: raw parametric {e1, e2, n} frame (needs strong encoder)
+  face_stitch_grad_compensate: true   # seam scatter_mean 反向按共享点数放大梯度（方案 A）
 
   # --- Grouper ---
   grouper_type: vertex_knn      # 'scan_knn' (original) or 'vertex_knn'
-  vertex_knn_k: 768             # points per vertex neighbourhood
-  vertex_knn_chunk_size: 768
+  vertex_knn_k: 512             # points per vertex neighbourhood
+  vertex_knn_chunk_size: 512
 
   # --- Encoder (PT Self-Attention) ---
   # 'pt_sa_attentive' (SA + attention pooling) or 'pt_sa_max' (SA + max pooling)
   encoder_type: pt_sa_attentive
   enc_hidden_dim: [64]          # light MLP before SA (fewer layers than original)
   pt_sa_dim: 128                # self-attention hidden dimension
-  pt_sa_num_heads: 1
+  pt_sa_num_heads: 4
   pt_sa_num_layers: 1
   pt_sa_use_ffn: true
   pt_sa_pe_frequencies: 4       # sinusoidal PE frequency bands
 
   # --- Shared model settings ---
-  feature_dim: 768
+  feature_dim: 512
   use_scan_normal: true
   use_feature_transform: false
   predict_offset: false
@@ -72,8 +73,8 @@ render:
   dist_multiplier: 0.4
   image_size: 512
   use_mixed_views: false
-  views_per_sample: 6
-  view_chunk_size: 3
+  views_per_sample: 4
+  view_chunk_size: 2
 seed: 42
 enable_attention_diagnostics: false
 train:

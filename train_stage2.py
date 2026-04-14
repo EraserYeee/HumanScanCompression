@@ -265,7 +265,6 @@ def train(config, args):
                 diagnostics_list = []  # Collect diagnostics from all batch items
                 
                 # Iterate over batch (Gradient Accumulation logic effectively)
-                did_backward_this_step = False
                 for b in range(len(base_verts_list)):
                     # Skip if empty mesh
                     if base_faces_list[b].shape[0] == 0:
@@ -328,17 +327,6 @@ def train(config, args):
                             step, b, tag=tag
                         )
                         if not is_valid:
-                            # In DDP, every rank must participate in backward for each step.
-                            # If we skip this sample directly, this rank may not reduce grads
-                            # while other ranks do, leading to "Expected to have finished reduction".
-                            zero_sync_loss = f_verts.sum() * 0.0
-                            if model_kl_loss is not None:
-                                zero_sync_loss = zero_sync_loss + model_kl_loss * 0.0
-                            zero_sync_loss = zero_sync_loss / len(base_verts_list)
-                            accelerator.backward(zero_sync_loss)
-                            did_backward_this_step = True
-                            del zero_sync_loss
-
                             # Release tensors before skipping this sample
                             del f_verts, f_faces, disp, trans_feat, vertex_features
                             if model_kl_loss is not None:
@@ -517,7 +505,6 @@ def train(config, args):
                             chunk_loss = chunk_loss / len(base_verts_list)
                         
                             accelerator.backward(chunk_loss, retain_graph=not is_last_chunk)
-                            did_backward_this_step = True
                         
                             if vc == 0 and should_export and accelerator.is_main_process:
                                 debug_export_images(
@@ -542,7 +529,6 @@ def train(config, args):
                     else:
                         loss_nr_scaled = loss_non_render / len(base_verts_list)
                         accelerator.backward(loss_nr_scaled)
-                        did_backward_this_step = True
                         del loss_nr_scaled
                 
                     loss_render_avg = loss_render_accum / max(num_view_chunks, 1)
@@ -566,16 +552,6 @@ def train(config, args):
                         del f_faces_expanded
                     del loss_non_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl
                 
-                if not did_backward_this_step:
-                    # Rare fallback: if all local samples were skipped, still trigger a
-                    # zero-gradient backward touching all parameters to keep DDP in sync.
-                    zero_sync_loss = None
-                    for p in model.parameters():
-                        term = p.sum() * 0.0
-                        zero_sync_loss = term if zero_sync_loss is None else (zero_sync_loss + term)
-                    accelerator.backward(zero_sync_loss)
-                    del zero_sync_loss
-
                 optimizer.step()
 
                 if accelerator.is_main_process and profile_timing and (train_profile_batch_i % profile_interval == 0):
