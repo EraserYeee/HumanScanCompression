@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .grouper import LocalPatchGrouper, VertexKNNGrouper, FaceKNNGrouper, FaceLocalGrouper
+from .grouper import LocalPatchGrouper, VertexKNNGrouper, FaceKNNGrouper, FaceAutoGrouper, FaceLocalGrouper
 from .timing_hooks import prof_start, prof_split, profile_is_rank0
 from .encoder import (
     LocalFeatureEncoder,
@@ -42,6 +42,11 @@ class Stage2Pipeline(nn.Module):
                 knn_chunk = config.get('vertex_knn_chunk_size', 512)
                 self.grouper = FaceKNNGrouper(k=knn_k, knn_chunk_size=knn_chunk)
                 print(f"Grouper: FaceKNNGrouper (K={knn_k}, chunk={knn_chunk})")
+            elif grouper_type == 'auto_knn':
+                min_pts = config.get('auto_knn_min_pts', 16)
+                knn_chunk = config.get('vertex_knn_chunk_size', 512)
+                self.grouper = FaceAutoGrouper(min_pts=min_pts, knn_chunk_size=knn_chunk)
+                print(f"Grouper: FaceAutoGrouper (min_pts={min_pts}, buckets={FaceAutoGrouper.BUCKET_SIZES})")
             else:
                 self.grouper = FaceLocalGrouper()
                 print("Grouper: FaceLocalGrouper (scan_knn, face centroids)")
@@ -221,10 +226,16 @@ class Stage2Pipeline(nn.Module):
 
         is_face = self.encoding_mode == 'face'
         is_vertex_knn = self.grouper_type == 'vertex_knn'
+        is_auto_knn = self.grouper_type == 'auto_knn'
         is_pt_sa = isinstance(self.encoder, (PTSAEncoder, PTFlashHierarchicalEncoder))
 
         if is_face:
-            if is_vertex_knn:
+            if is_auto_knn:
+                auto_buckets = self.grouper(
+                    base_verts, base_faces, scan_points,
+                    scan_normals=scan_normals if self.use_scan_normal else None,
+                )
+            elif is_vertex_knn:
                 grouped_features, local_coords = self.grouper(
                     base_verts, base_faces, scan_points,
                     scan_normals=scan_normals if self.use_scan_normal else None,
@@ -253,7 +264,18 @@ class Stage2Pipeline(nn.Module):
 
         num_anchors = num_faces_dim if is_face else V
 
-        if is_pt_sa:
+        if is_auto_knn and is_pt_sa:
+            t0 = prof_start() if do_log else None
+            feat_dim = self.encoder.feature_dim
+            vertex_features = torch.zeros(B, num_faces_dim, feat_dim,
+                                          device=base_verts.device)
+            for gf_bk, lc_bk, fidx_bk in auto_buckets:
+                bk_feat, _ = self.encoder(gf_bk, lc_bk)
+                vertex_features[0, fidx_bk[0]] = bk_feat[0]
+            trans_feat = None
+            if do_log:
+                prof_split(True, t0, "encoder(total)", "pipe")
+        elif is_pt_sa:
             t0 = prof_start() if do_log else None
             vertex_features, trans_feat = self.encoder(grouped_features, local_coords)
             if do_log:

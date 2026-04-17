@@ -457,6 +457,156 @@ class FaceKNNGrouper(nn.Module):
         return grouped_features, local_coords
 
 
+class FaceAutoGrouper(nn.Module):
+    """Scan-side assignment + bucketed padding grouper.
+
+    1. Each scan point → nearest face centroid (scan-side 1-NN).
+    2. Faces bucketed by natural point count:
+         bucket 0: [0, 256]   (sparse < min_pts use face-side KNN fallback)
+         bucket 1: [257, 512]
+         bucket 2: [513, +∞)  (>1024 randomly subsampled)
+    3. Padded to bucket boundary with centroid copies (no mask → flash OK).
+    4. Triangle parametric coords computed vectorized per bucket.
+    """
+
+    BUCKET_SIZES = (256, 512, 1024)
+
+    def __init__(self, min_pts: int = 16, knn_chunk_size: int = 512):
+        super().__init__()
+        self.min_pts = min_pts
+        self.knn_chunk_size = knn_chunk_size
+
+    @torch.no_grad()
+    def _assign_and_sort(self, scan_points, centroids):
+        """Scan-side 1-NN + count + sort."""
+        knn_res = knn_points(scan_points, centroids, K=1)
+        assign = knn_res.idx.squeeze(-1)                          # (1, P)
+        F_num = centroids.shape[1]
+        device = centroids.device
+
+        counts = torch.zeros(F_num, dtype=torch.long, device=device)
+        counts.scatter_add_(0, assign[0],
+                            torch.ones(assign.shape[1], dtype=torch.long, device=device))
+
+        order = assign[0].argsort()
+        splits = torch.cat([torch.zeros(1, dtype=torch.long, device=device),
+                            counts.cumsum(0)])
+        return assign, counts, order, splits
+
+    def forward(
+        self,
+        base_verts: torch.Tensor,
+        base_faces: torch.Tensor,
+        scan_points: torch.Tensor,
+        scan_normals: torch.Tensor | None = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Returns:
+            buckets: list of (grouped_features, local_coords, face_idx)
+                grouped_features: (1, N_bk, K_bk, D)
+                local_coords:     (1, N_bk, K_bk, 3)
+                face_idx:         (1, N_bk)
+        """
+        device = base_verts.device
+        assert base_verts.shape[0] == 1, "FaceAutoGrouper supports B=1"
+
+        v0, e1, e2, fn, g11, g12, g22, det = _compute_face_basis(
+            base_verts, base_faces
+        )
+        centroids = v0 + (e1 + e2) / 3.0                         # (1, F, 3)
+        F_num = centroids.shape[1]
+
+        _, counts, order, splits = self._assign_and_sort(scan_points, centroids)
+
+        sorted_pts = scan_points[0][order]
+        sorted_nrm = scan_normals[0][order] if scan_normals is not None else None
+
+        sparse_mask = counts < self.min_pts
+        sparse_ids = sparse_mask.nonzero(as_tuple=False).view(-1)
+
+        # KNN fallback for sparse faces → smallest bucket size
+        fb_idx = None
+        if sparse_ids.numel() > 0:
+            fb_q = centroids[0, sparse_ids].unsqueeze(0)
+            fb_idx = _chunked_topk_knn(
+                fb_q, scan_points, self.BUCKET_SIZES[0],
+                chunk_size=self.knn_chunk_size,
+            ).squeeze(0)                                          # (N_sp, 256)
+
+        # --- deterministic bucket assignment (every face gets exactly one) ---
+        bucket_id = torch.full((F_num,), 0, dtype=torch.long, device=device)
+        ns = ~sparse_mask
+        bucket_id[ns & (counts > self.BUCKET_SIZES[0])] = 1
+        bucket_id[ns & (counts > self.BUCKET_SIZES[1])] = 2
+        # sparse faces stay at bucket 0
+
+        buckets_out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+        for bi, bk_size in enumerate(self.BUCKET_SIZES):
+            face_ids = (bucket_id == bi).nonzero(as_tuple=False).view(-1)
+            if face_ids.numel() == 0:
+                continue
+            N_bk = face_ids.numel()
+
+            # Pre-fill with centroid copies (automatic padding)
+            pts_bk = centroids[0, face_ids].unsqueeze(1).expand(
+                -1, bk_size, -1).clone()                          # (N_bk, bk, 3)
+            nrm_bk = None
+            if scan_normals is not None:
+                nrm_bk = fn[0, face_ids].unsqueeze(1).expand(
+                    -1, bk_size, -1).clone()
+
+            # Fill real points per face
+            for li in range(N_bk):
+                fi = face_ids[li].item()
+
+                if sparse_mask[fi] and fb_idx is not None:
+                    sp_pos = (sparse_ids == fi).nonzero(as_tuple=False)[0, 0]
+                    pts_bk[li] = scan_points[0][fb_idx[sp_pos]]
+                    if nrm_bk is not None:
+                        nrm_bk[li] = scan_normals[0][fb_idx[sp_pos]]
+                    continue
+
+                s, e = splits[fi].item(), splits[fi + 1].item()
+                ni = e - s
+                if ni >= bk_size:
+                    perm = torch.randperm(ni, device=device)[:bk_size]
+                    pts_bk[li] = sorted_pts[s:e][perm]
+                    if nrm_bk is not None:
+                        nrm_bk[li] = sorted_nrm[s:e][perm]
+                elif ni > 0:
+                    pts_bk[li, :ni] = sorted_pts[s:e]
+                    if nrm_bk is not None:
+                        nrm_bk[li, :ni] = sorted_nrm[s:e]
+                # ni==0 impossible for non-sparse faces (count >= min_pts)
+
+            # --- vectorized triangle coordinate conversion ---
+            v0_bk = v0[0, face_ids].unsqueeze(1)                  # (N_bk, 1, 3)
+            delta = pts_bk - v0_bk                                # (N_bk, bk, 3)
+            local_coords = _world_to_tri(
+                delta.unsqueeze(0),
+                e1[0, face_ids].unsqueeze(0),
+                e2[0, face_ids].unsqueeze(0),
+                fn[0, face_ids].unsqueeze(0),
+                g11[0, face_ids].unsqueeze(0),
+                g12[0, face_ids].unsqueeze(0),
+                g22[0, face_ids].unsqueeze(0),
+                det[0, face_ids].unsqueeze(0),
+            )                                                     # (1, N_bk, bk, 3)
+
+            if nrm_bk is not None:
+                delta_nrm = nrm_bk - fn[0, face_ids].unsqueeze(1)
+                grouped_features = torch.cat(
+                    [local_coords.squeeze(0), delta_nrm], dim=-1
+                ).unsqueeze(0)                                    # (1, N_bk, bk, D)
+            else:
+                grouped_features = local_coords
+
+            buckets_out.append((grouped_features, local_coords, face_ids.unsqueeze(0)))
+
+        return buckets_out
+
+
 class FaceLocalGrouper(nn.Module):
     """Scan-side KNN=1 grouper using face centroids instead of vertices.
     Each scan point is assigned to its nearest face and encoded in that

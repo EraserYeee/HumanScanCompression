@@ -6,10 +6,20 @@ Usage:
         --point_num 819200 --angle_threshold 30 --sharp_ratio 0.5 \
         --output_dir demo_output
 
+    # scan_knn: scan point cloud + base mesh (matches Stage2: scan → base face centroids)
+    python demo_sharp_sampling.py --scan_mesh gt.obj --base_mesh base.obj --scan_knn_only
+    python demo_sharp_sampling.py --scan_mesh gt.obj --base_mesh base.obj --scan_knn_only --use_dora
+    python demo_sharp_sampling.py --scan_ply scan.ply --base_mesh base.obj --scan_knn_only
+
+    # With legacy demos on the same --input mesh, plus scan_knn pair:
+    python demo_sharp_sampling.py --input gt.obj --base_mesh base.obj --scan_knn
+
 Outputs (PLY point clouds):
-    uniform.ply      – 100% uniform surface sampling
-    sharp_only.ply   – 100% sharp-edge sampling (with fallback uniform fill)
-    mixed.ply        – sharp_ratio% sharp + rest uniform
+    uniform.ply           – 100% uniform surface sampling (on --input)
+    sharp_only.ply        – 100% sharp-edge sampling (on --input)
+    mixed.ply             – sharp_ratio% sharp + rest uniform (on --input)
+    scan_knn_uniform.ply  – scan points colored by base-mesh face cluster
+    scan_knn_dora.ply     – same, scan sampled with Dora from scan_mesh
 """
 
 import argparse
@@ -18,6 +28,10 @@ import time
 import numpy as np
 import trimesh
 import open3d as o3d
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -197,18 +211,54 @@ def sharp_edge_sample(
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  scan_knn: assign scan points to faces (same rule as FaceLocalGrouper)
+# ──────────────────────────────────────────────────────────────────────
+
+def assign_points_to_faces_scan_knn(base_mesh: trimesh.Trimesh, points: np.ndarray) -> np.ndarray:
+    """Nearest face centroid on base_mesh (K=1), matching training FaceLocalGrouper."""
+    centroids = base_mesh.triangles_center
+    tree = cKDTree(centroids)
+    _, face_idx = tree.query(points, k=1)
+    return np.asarray(face_idx, dtype=np.int64).ravel()
+
+
+def per_face_point_stats(face_idx: np.ndarray, num_faces: int) -> dict:
+    """Histogram of scan points per triangle face."""
+    counts = np.bincount(face_idx.astype(np.int64), minlength=num_faces)
+    return {
+        'counts': counts,
+        'mean': float(counts.mean()),
+        'max': int(counts.max()),
+        'min': int(counts.min()),
+        'num_empty_faces': int((counts == 0).sum()),
+        'num_points': int(face_idx.shape[0]),
+        'num_faces': int(num_faces),
+    }
+
+
+def _cluster_colors(cluster_ids: np.ndarray) -> np.ndarray:
+    """RGB (N, 3) in [0, 1] from face indices via tab20 cycling."""
+    cmap = plt.get_cmap('tab20')
+    ids = cluster_ids.astype(np.int64)
+    t = (ids % 20) / 20.0
+    return cmap(t)[:, :3].astype(np.float64)
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  I/O helpers
 # ──────────────────────────────────────────────────────────────────────
 
-def save_ply(path, points, normals=None):
+def save_ply(path, points, normals=None, cluster_ids=None):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     if normals is not None:
         pcd.normals = o3d.utility.Vector3dVector(normals)
-    # Color by z-height for visualization
-    z = points[:, 2]
-    z_norm = (z - z.min()) / (z.max() - z.min() + 1e-8)
-    colors = np.stack([z_norm, 0.4 * np.ones_like(z_norm), 1.0 - z_norm], axis=1)
+    if cluster_ids is not None:
+        colors = _cluster_colors(cluster_ids)
+    else:
+        z = points[:, 2]
+        z_norm = (z - z.min()) / (z.max() - z.min() + 1e-8)
+        colors = np.stack([z_norm, 0.4 * np.ones_like(z_norm), 1.0 - z_norm], axis=1)
     pcd.colors = o3d.utility.Vector3dVector(colors)
     o3d.io.write_point_cloud(path, pcd, write_ascii=False)
 
@@ -224,108 +274,253 @@ def normalize_to_unit_sphere(vertices):
     return vertices / scale
 
 
+def joint_unit_sphere_transform(*parts: np.ndarray):
+    """One center/scale from the union of point sets (scan + base stay aligned)."""
+    allv = np.concatenate([np.asarray(p, dtype=np.float64) for p in parts], axis=0)
+    bbox_min = allv.min(axis=0)
+    bbox_max = allv.max(axis=0)
+    center = (bbox_min + bbox_max) / 2
+    allv = allv - center
+    scale = np.max(np.linalg.norm(allv, axis=1))
+    if scale < 1e-6:
+        scale = 1.0
+    return center, scale
+
+
+def apply_unit_sphere(pts: np.ndarray, center: np.ndarray, scale: float) -> np.ndarray:
+    return (np.asarray(pts, dtype=np.float64) - center) / scale
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Main
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Sharp Edge Sampling Demo")
-    parser.add_argument("--input", type=str, required=True, help="Input mesh path (.obj / .ply / .stl)")
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Mesh for legacy demos (uniform/sharp/mixed). Also default scan surface for scan_knn if --scan_mesh unset.",
+    )
     parser.add_argument("--point_num", type=int, default=819200)
     parser.add_argument("--angle_threshold", type=float, default=30.0, help="Dihedral angle threshold (degrees)")
     parser.add_argument("--sharp_ratio", type=float, default=0.5, help="Fraction of points from sharp edges")
     parser.add_argument("--output_dir", type=str, default="demo_sharp_output")
+    parser.add_argument(
+        "--base_mesh",
+        type=str,
+        default=None,
+        help="Base (simplified) mesh; scan_knn assigns each scan point to nearest face centroid here (required for scan_knn).",
+    )
+    parser.add_argument(
+        "--scan_mesh",
+        type=str,
+        default=None,
+        help="Mesh to sample scan points from (e.g. GT). Default: --input. Ignored if --scan_ply is set.",
+    )
+    parser.add_argument(
+        "--scan_ply",
+        type=str,
+        default=None,
+        help="Use this point cloud as scan (no surface sampling). Joint-normalized with base_mesh vertices.",
+    )
+    parser.add_argument(
+        "--scan_knn",
+        action="store_true",
+        help="After legacy demos, run scan→base_mesh face-centroid assignment + stats + PLY",
+    )
+    parser.add_argument(
+        "--scan_knn_only",
+        action="store_true",
+        help="Skip uniform/sharp_only/mixed; only run scan_knn demo",
+    )
+    parser.add_argument(
+        "--use_dora",
+        action="store_true",
+        help="With scan_knn: Dora-style sharp+uniform on scan_mesh (ignored with --scan_ply)",
+    )
     args = parser.parse_args()
+
+    run_legacy = not args.scan_knn_only
+    run_scan_knn = args.scan_knn or args.scan_knn_only
+
+    if run_legacy and not args.input:
+        parser.error("--input is required for legacy uniform / sharp_only / mixed demos")
+    if run_scan_knn:
+        if not args.base_mesh:
+            parser.error("--base_mesh is required for scan_knn (assign scan points to base mesh faces)")
+        scan_src = args.scan_ply or args.scan_mesh or args.input
+        if not scan_src:
+            parser.error("scan_knn needs scan data: set --scan_ply, or --scan_mesh, or --input as scan surface")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load & normalize
-    print(f"Loading mesh: {args.input}")
-    t_load = time.time()
-    mesh = trimesh.load(args.input, force='mesh', process=False)
-    verts = normalize_to_unit_sphere(mesh.vertices)
-    mesh = trimesh.Trimesh(vertices=verts, faces=mesh.faces, process=False)
-    t_load = time.time() - t_load
-    print(f"  Loaded: V={len(mesh.vertices)}, F={len(mesh.faces)}")
-    print(f"  Load + normalize time: {t_load:.3f}s")
-    print()
+    mesh = None
+    t_load = 0.0
+    if run_legacy:
+        print(f"Loading mesh (legacy): {args.input}")
+        t_load = time.time()
+        mesh = trimesh.load(args.input, force='mesh', process=False)
+        verts = normalize_to_unit_sphere(mesh.vertices)
+        mesh = trimesh.Trimesh(vertices=verts, faces=mesh.faces, process=False)
+        t_load = time.time() - t_load
+        print(f"  Loaded: V={len(mesh.vertices)}, F={len(mesh.faces)}")
+        print(f"  Load + normalize time: {t_load:.3f}s")
+        print()
 
-    # ── 1. Uniform only ──────────────────────────────────────────────
-    print("=" * 60)
-    print("[1] Uniform surface sampling")
-    t0 = time.time()
-    uniform_pts, face_idx = trimesh.sample.sample_surface(mesh, args.point_num)
-    uniform_pts = uniform_pts.astype(np.float32)
-    uniform_nrm = mesh.face_normals[face_idx].astype(np.float32)
-    t_uniform = time.time() - t0
-    print(f"  Points: {len(uniform_pts)}")
-    print(f"  Time:   {t_uniform:.3f}s")
-    out_path = os.path.join(args.output_dir, "uniform.ply")
-    save_ply(out_path, uniform_pts, uniform_nrm)
-    print(f"  Saved:  {out_path}")
-    print()
+    t_uniform = total_sharp = total_mix = None
+    stats_mix = None
 
-    # ── 2. Sharp edge only (ratio=1.0) ───────────────────────────────
-    print("=" * 60)
-    print("[2] Sharp edge sampling only (ratio=1.0)")
-    sharp_only_pts, sharp_only_nrm, stats_sharp = sharp_edge_sample(
-        mesh, args.point_num,
-        angle_threshold_deg=args.angle_threshold,
-        sharp_ratio=1.0,
-        min_sharp_fallback=0.0,
-    )
-    print(f"  Sharp edges detected: {stats_sharp['num_sharp_edges']}")
-    if stats_sharp['num_sharp_edges'] > 0:
-        print(f"  Angle range: mean={stats_sharp['angle_mean']:.1f}°, max={stats_sharp['angle_max']:.1f}°")
-    print(f"  Sharp points sampled: {stats_sharp['num_sharp_sampled']}")
-    print(f"  Uniform fill points:  {stats_sharp['total_points'] - stats_sharp['num_sharp_sampled']}")
-    print(f"  Timing:")
-    print(f"    detect sharp edges:  {stats_sharp['detect_time']:.3f}s")
-    print(f"    sample sharp points: {stats_sharp['sharp_sample_time']:.3f}s")
-    print(f"    sample uniform fill: {stats_sharp['uniform_sample_time']:.3f}s")
-    total_sharp = stats_sharp['detect_time'] + stats_sharp['sharp_sample_time'] + stats_sharp['uniform_sample_time']
-    print(f"    total:               {total_sharp:.3f}s")
-    out_path = os.path.join(args.output_dir, "sharp_only.ply")
-    save_ply(out_path, sharp_only_pts, sharp_only_nrm)
-    print(f"  Saved:  {out_path}")
-    print()
+    if run_legacy:
+        # ── 1. Uniform only ──────────────────────────────────────────────
+        print("=" * 60)
+        print("[1] Uniform surface sampling")
+        t0 = time.time()
+        uniform_pts, face_idx = trimesh.sample.sample_surface(mesh, args.point_num)
+        uniform_pts = uniform_pts.astype(np.float32)
+        uniform_nrm = mesh.face_normals[face_idx].astype(np.float32)
+        t_uniform = time.time() - t0
+        print(f"  Points: {len(uniform_pts)}")
+        print(f"  Time:   {t_uniform:.3f}s")
+        out_path = os.path.join(args.output_dir, "uniform.ply")
+        save_ply(out_path, uniform_pts, uniform_nrm)
+        print(f"  Saved:  {out_path}")
+        print()
 
-    # ── 3. Mixed (sharp + uniform) ───────────────────────────────────
-    print("=" * 60)
-    print(f"[3] Mixed sampling (sharp_ratio={args.sharp_ratio})")
-    mixed_pts, mixed_nrm, stats_mix = sharp_edge_sample(
-        mesh, args.point_num,
-        angle_threshold_deg=args.angle_threshold,
-        sharp_ratio=args.sharp_ratio,
-    )
-    print(f"  Sharp edges detected: {stats_mix['num_sharp_edges']}")
-    print(f"  Sharp points:         {stats_mix['num_sharp_sampled']}")
-    print(f"  Uniform points:       {stats_mix['total_points'] - stats_mix['num_sharp_sampled']}")
-    print(f"  Fallback to uniform:  {stats_mix['sharp_fallback']}")
-    print(f"  Timing:")
-    print(f"    detect sharp edges:  {stats_mix['detect_time']:.3f}s")
-    print(f"    sample sharp points: {stats_mix['sharp_sample_time']:.3f}s")
-    print(f"    sample uniform fill: {stats_mix['uniform_sample_time']:.3f}s")
-    total_mix = stats_mix['detect_time'] + stats_mix['sharp_sample_time'] + stats_mix['uniform_sample_time']
-    print(f"    total:               {total_mix:.3f}s")
-    out_path = os.path.join(args.output_dir, "mixed.ply")
-    save_ply(out_path, mixed_pts, mixed_nrm)
-    print(f"  Saved:  {out_path}")
-    print()
+        # ── 2. Sharp edge only (ratio=1.0) ───────────────────────────────
+        print("=" * 60)
+        print("[2] Sharp edge sampling only (ratio=1.0)")
+        sharp_only_pts, sharp_only_nrm, stats_sharp = sharp_edge_sample(
+            mesh, args.point_num,
+            angle_threshold_deg=args.angle_threshold,
+            sharp_ratio=1.0,
+            min_sharp_fallback=0.0,
+        )
+        print(f"  Sharp edges detected: {stats_sharp['num_sharp_edges']}")
+        if stats_sharp['num_sharp_edges'] > 0:
+            print(f"  Angle range: mean={stats_sharp['angle_mean']:.1f}°, max={stats_sharp['angle_max']:.1f}°")
+        print(f"  Sharp points sampled: {stats_sharp['num_sharp_sampled']}")
+        print(f"  Uniform fill points:  {stats_sharp['total_points'] - stats_sharp['num_sharp_sampled']}")
+        print(f"  Timing:")
+        print(f"    detect sharp edges:  {stats_sharp['detect_time']:.3f}s")
+        print(f"    sample sharp points: {stats_sharp['sharp_sample_time']:.3f}s")
+        print(f"    sample uniform fill: {stats_sharp['uniform_sample_time']:.3f}s")
+        total_sharp = stats_sharp['detect_time'] + stats_sharp['sharp_sample_time'] + stats_sharp['uniform_sample_time']
+        print(f"    total:               {total_sharp:.3f}s")
+        out_path = os.path.join(args.output_dir, "sharp_only.ply")
+        save_ply(out_path, sharp_only_pts, sharp_only_nrm)
+        print(f"  Saved:  {out_path}")
+        print()
+
+        # ── 3. Mixed (sharp + uniform) ───────────────────────────────────
+        print("=" * 60)
+        print(f"[3] Mixed sampling (sharp_ratio={args.sharp_ratio})")
+        mixed_pts, mixed_nrm, stats_mix = sharp_edge_sample(
+            mesh, args.point_num,
+            angle_threshold_deg=args.angle_threshold,
+            sharp_ratio=args.sharp_ratio,
+        )
+        print(f"  Sharp edges detected: {stats_mix['num_sharp_edges']}")
+        print(f"  Sharp points:         {stats_mix['num_sharp_sampled']}")
+        print(f"  Uniform points:       {stats_mix['total_points'] - stats_mix['num_sharp_sampled']}")
+        print(f"  Fallback to uniform:  {stats_mix['sharp_fallback']}")
+        print(f"  Timing:")
+        print(f"    detect sharp edges:  {stats_mix['detect_time']:.3f}s")
+        print(f"    sample sharp points: {stats_mix['sharp_sample_time']:.3f}s")
+        print(f"    sample uniform fill: {stats_mix['uniform_sample_time']:.3f}s")
+        total_mix = stats_mix['detect_time'] + stats_mix['sharp_sample_time'] + stats_mix['uniform_sample_time']
+        print(f"    total:               {total_mix:.3f}s")
+        out_path = os.path.join(args.output_dir, "mixed.ply")
+        save_ply(out_path, mixed_pts, mixed_nrm)
+        print(f"  Saved:  {out_path}")
+        print()
+
+    if run_scan_knn:
+        print("=" * 60)
+        print("[scan_knn] Assign scan points → base mesh faces (nearest face centroid)")
+        t_sk = time.time()
+
+        base_raw = trimesh.load(args.base_mesh, force='mesh', process=False)
+        print(f"  Base mesh (raw): {args.base_mesh}  V={len(base_raw.vertices)}, F={len(base_raw.faces)}")
+
+        if args.scan_ply:
+            pcd = o3d.io.read_point_cloud(args.scan_ply)
+            sp = np.asarray(pcd.points, dtype=np.float64)
+            if sp.size == 0:
+                raise ValueError(f"No points in {args.scan_ply}")
+            center, scale = joint_unit_sphere_transform(sp, base_raw.vertices)
+            sk_pts = apply_unit_sphere(sp, center, scale).astype(np.float32)
+            bv = apply_unit_sphere(base_raw.vertices, center, scale)
+            base_mesh_knn = trimesh.Trimesh(vertices=bv, faces=base_raw.faces, process=False)
+            sk_nrm = None
+            if pcd.has_normals():
+                n = np.asarray(pcd.normals, dtype=np.float64)
+                n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
+                sk_nrm = n.astype(np.float32)
+            print(f"  Scan: point cloud {args.scan_ply}  N={len(sk_pts)} (joint normalize with base)")
+            print(f"  Note: --use_dora ignored when using --scan_ply")
+            out_name = "scan_knn_scanply.ply"
+        else:
+            sm_path = args.scan_mesh or args.input
+            scan_raw = trimesh.load(sm_path, force='mesh', process=False)
+            center, scale = joint_unit_sphere_transform(scan_raw.vertices, base_raw.vertices)
+            sv = apply_unit_sphere(scan_raw.vertices, center, scale)
+            bv = apply_unit_sphere(base_raw.vertices, center, scale)
+            scan_mesh_n = trimesh.Trimesh(vertices=sv, faces=scan_raw.faces, process=False)
+            base_mesh_knn = trimesh.Trimesh(vertices=bv, faces=base_raw.faces, process=False)
+            print(f"  Scan surface mesh: {sm_path}  V={len(scan_mesh_n.vertices)}, F={len(scan_mesh_n.faces)}")
+            print(f"  Joint unit-sphere: center {center}, scale {scale:.6f}")
+
+            if args.use_dora:
+                sk_pts, sk_nrm, sk_dora = sharp_edge_sample(
+                    scan_mesh_n,
+                    args.point_num,
+                    angle_threshold_deg=args.angle_threshold,
+                    sharp_ratio=args.sharp_ratio,
+                )
+                print(f"  Dora: sharp_pts={sk_dora['num_sharp_sampled']}, "
+                      f"uniform_pts={sk_dora['total_points'] - sk_dora['num_sharp_sampled']}, "
+                      f"fallback_all_uniform={sk_dora['sharp_fallback']}")
+                out_name = "scan_knn_dora.ply"
+            else:
+                sk_pts, sk_face = trimesh.sample.sample_surface(scan_mesh_n, args.point_num)
+                sk_pts = sk_pts.astype(np.float32)
+                sk_nrm = scan_mesh_n.face_normals[sk_face].astype(np.float32)
+                out_name = "scan_knn_uniform.ply"
+
+        face_assign = assign_points_to_faces_scan_knn(base_mesh_knn, sk_pts)
+        st = per_face_point_stats(face_assign, len(base_mesh_knn.faces))
+        t_sk = time.time() - t_sk
+
+        print(f"  Assignment target: base mesh F={st['num_faces']}, scan points N={st['num_points']}")
+        print(f"  Per-face point count — mean: {st['mean']:.4f}, max: {st['max']}, min: {st['min']}")
+        print(f"  Faces with zero points: {st['num_empty_faces']}")
+        print(f"  Time (load + sample + assign): {t_sk:.3f}s")
+
+        out_path = os.path.join(args.output_dir, out_name)
+        save_ply(out_path, sk_pts, sk_nrm, cluster_ids=face_assign)
+        print(f"  Saved: {out_path}")
+        print()
 
     # ── Summary ──────────────────────────────────────────────────────
     print("=" * 60)
     print("Summary")
-    print(f"  Mesh:            V={len(mesh.vertices)}, F={len(mesh.faces)}")
+    if mesh is not None:
+        print(f"  Legacy mesh (--input): V={len(mesh.vertices)}, F={len(mesh.faces)}")
+    if args.base_mesh:
+        print(f"  scan_knn base:        {args.base_mesh}")
     print(f"  point_num:       {args.point_num}")
     print(f"  angle_threshold: {args.angle_threshold}°")
     print(f"  sharp_ratio:     {args.sharp_ratio}")
-    print(f"  sharp_edges:     {stats_mix['num_sharp_edges']}")
+    if stats_mix is not None:
+        print(f"  sharp_edges:     {stats_mix['num_sharp_edges']}")
     print()
-    print(f"  Uniform only:    {t_uniform:.3f}s")
-    print(f"  Sharp only:      {total_sharp:.3f}s")
-    print(f"  Mixed:           {total_mix:.3f}s")
-    print()
+    if t_uniform is not None:
+        print(f"  Uniform only:    {t_uniform:.3f}s")
+        print(f"  Sharp only:      {total_sharp:.3f}s")
+        print(f"  Mixed:           {total_mix:.3f}s")
+        print()
     print(f"Output directory: {args.output_dir}")
 
 
