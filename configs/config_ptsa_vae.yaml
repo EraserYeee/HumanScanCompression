@@ -5,19 +5,15 @@ data:
   data_root: /home/ruisi/mesh_compression/data/official
   lmdb_path: /mnt/lab/data/yeruisi/data/compression/datalmdb/train.lmdb
   num_workers: 2
-  persistent_workers: false   # 避免 worker 常驻导致内存累计
-  pin_memory: false           # 内存紧张时更稳
-  prefetch_factor: 1
   point_num: 819200
   preload_ram: false
   preprocessed_base_mesh_dir: /mnt/lab/data/yeruisi/data/compression/base_mesh_preload2
   processed_dir: /mnt/lab/data/yeruisi/data/compression/dataset_preload2
   simplification_backend: pyfqmr
   use_preprocess_base_mesh: true
-  sharp_edge_sampling: true         # 启用 sharp edge biased sampling
+  sharp_edge_sampling: false         # 启用 sharp edge biased sampling
   sharp_edge_angle_threshold: 10.0   # 二面角阈值 (度)
   sharp_edge_ratio: 0.5              # sharp 点占总采样点的比例
-  sharp_cache_size: 64               # per-worker LRU cache；0 表示关闭
 device: cuda
 experiment_name: stage2_ptsa_attentive_facecoding_autoknn
 loss:
@@ -67,7 +63,7 @@ model:
 
   # --- Decoder ---
   decoder_type: sum_of_feature
-  dec_hidden_dim: [512, 256, 128, 64]
+  dec_hidden_dim: [256, 128, 64]
   subdivision_levels: 8
   subdivision_rate: 14
 
@@ -78,10 +74,10 @@ render:
   dist_multiplier: 0.4
   image_size: 512
   use_mixed_views: false
-  views_per_sample: 8
-  view_chunk_size: 2
+  views_per_sample: 12
+  view_chunk_size: 3
   # 方案 C：几何感知视点（FPS on base mesh face centroids + 少量随机全局视点）
-  use_geometry_aware: false
+  use_geometry_aware: true
   geo_fps_ratio: 0.67          # FPS 视点占比，剩余为随机全局视点
   global_dist_multiplier: 1.0  # 随机全局视点距 mesh 中心的距离
 seed: 42

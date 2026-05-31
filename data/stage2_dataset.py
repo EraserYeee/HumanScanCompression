@@ -6,6 +6,7 @@ import trimesh
 import numpy as np
 import open3d as o3d
 import time
+from collections import OrderedDict
 from torch.utils.data import Dataset
 from pytorch3d.structures import Meshes
 
@@ -108,7 +109,8 @@ class ScanToMeshDataset(Dataset):
                  dataset_type='human',
                  sharp_edge_sampling=False,
                  sharp_edge_angle_threshold=10.0,
-                 sharp_edge_ratio=0.5):
+                 sharp_edge_ratio=0.5,
+                 sharp_cache_size=64):
         """
         Args:
             data_root: 预处理数据目录
@@ -140,9 +142,14 @@ class ScanToMeshDataset(Dataset):
         self.sharp_edge_sampling = sharp_edge_sampling
         self.sharp_edge_angle_threshold = sharp_edge_angle_threshold
         self.sharp_edge_ratio = sharp_edge_ratio
+        self.sharp_cache_size = int(max(0, sharp_cache_size))
         self.lmdb_env = None
         
-        self._sharp_cache = {}   # idx -> (sharp_edge_verts, sharp_face_pairs)
+        # NOTE:
+        # - persistent dataloader workers + unbounded cache 会导致 worker 常驻内存持续增长
+        # - 多卡多 worker 场景下会被系统 OOM killer 杀掉（日志表现为 DataLoader worker killed）
+        # 这里改为有界 LRU；设为 0 可关闭缓存。
+        self._sharp_cache = OrderedDict() if self.sharp_cache_size > 0 else None
         
         if self.sharp_edge_sampling:
             print(f"[Dataset] Sharp edge sampling ENABLED: threshold={self.sharp_edge_angle_threshold}°, ratio={self.sharp_edge_ratio}")
@@ -326,13 +333,17 @@ class ScanToMeshDataset(Dataset):
             return pts, nrm if self.use_scan_normal else None
 
         # Lookup or compute sharp edges (topology is deterministic per idx)
-        if idx in self._sharp_cache:
-            se_verts, se_faces = self._sharp_cache[idx]
+        if self._sharp_cache is not None and idx in self._sharp_cache:
+            se_verts, se_faces = self._sharp_cache.pop(idx)
+            self._sharp_cache[idx] = (se_verts, se_faces)  # LRU refresh
         else:
             threshold_rad = np.deg2rad(self.sharp_edge_angle_threshold)
             se_verts, se_faces = _detect_sharp_edges(
                 vertices, faces, face_nrm, threshold_rad)
-            self._sharp_cache[idx] = (se_verts, se_faces)
+            if self._sharp_cache is not None:
+                self._sharp_cache[idx] = (se_verts, se_faces)
+                if len(self._sharp_cache) > self.sharp_cache_size:
+                    self._sharp_cache.popitem(last=False)
 
         num_sharp_target = int(self.point_num * self.sharp_edge_ratio)
         min_sharp_fallback = 0.05

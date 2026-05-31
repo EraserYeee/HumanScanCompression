@@ -95,17 +95,25 @@ def train(config, args):
         sharp_edge_sampling=config['data'].get('sharp_edge_sampling', False),
         sharp_edge_angle_threshold=config['data'].get('sharp_edge_angle_threshold', 10.0),
         sharp_edge_ratio=config['data'].get('sharp_edge_ratio', 0.5),
+        sharp_cache_size=config['data'].get('sharp_cache_size', 64),
     )
     
     nw = config['data']['num_workers']
+    persistent_workers = config['data'].get('persistent_workers', nw > 0)
+    pin_memory = config['data'].get('pin_memory', True)
+    prefetch_factor = config['data'].get('prefetch_factor', 2)
+    dl_kwargs = {}
+    if nw > 0:
+        dl_kwargs['persistent_workers'] = persistent_workers
+        dl_kwargs['prefetch_factor'] = prefetch_factor
     dataloader = DataLoader(
         dataset, 
         batch_size=config['data']['batch_size'], 
         shuffle=True, 
         num_workers=nw,
         collate_fn=stage2_collate_fn,
-        pin_memory=True,
-        persistent_workers=nw > 0,
+        pin_memory=pin_memory,
+        **dl_kwargs,
     )
 
     # 3. Setup Model
@@ -128,7 +136,10 @@ def train(config, args):
         image_size=config['render']['image_size'], 
         device=accelerator.device, 
         cameras_per_batch=view_chunk_size,
-        dist_multiplier=config['render'].get('dist_multiplier', 1.0)
+        dist_multiplier=config['render'].get('dist_multiplier', 1.0),
+        use_geometry_aware=config['render'].get('use_geometry_aware', False),
+        geo_fps_ratio=config['render'].get('geo_fps_ratio', 0.67),
+        global_dist_multiplier=config['render'].get('global_dist_multiplier', None),
     )
 
     # 5. Optimizer
@@ -371,7 +382,10 @@ def train(config, args):
                             beta = vae_beta * (epoch / max(vae_warmup_epochs, 1))
                         else:
                             beta = vae_beta
-                        loss_kl = beta * model_kl_loss
+                        # Clamp raw KL before beta to avoid inf/NaN destabilizing training and
+                        # breaking chunked backward when render terms are all zero-constants.
+                        kl_raw = torch.clamp(model_kl_loss, max=1e4)
+                        loss_kl = beta * kl_raw
                 
                     w_mat = config['loss'].get('w_mat', 0.001)
                     if use_chamfer:
@@ -422,7 +436,8 @@ def train(config, args):
                             is_last_chunk = (vc == num_view_chunks - 1)
                         
                             pred_img, gt_img, pred_depth, gt_depth = renderer(
-                                f_verts, f_faces_expanded, g_verts, g_faces
+                                f_verts, f_faces_expanded, g_verts, g_faces,
+                                base_verts=b_verts, base_faces=b_faces,
                             )
                         
                             loss_depth_l1 = torch.tensor(0.0, device=accelerator.device)
@@ -503,6 +518,18 @@ def train(config, args):
                             if is_last_chunk:
                                 chunk_loss = chunk_loss + loss_non_render
                             chunk_loss = chunk_loss / len(base_verts_list)
+                            # Non-last chunks only contain render loss. If every mask is empty,
+                            # chunk_render_loss is built only from torch.tensor(0.) → no grad_fn;
+                            # backward() then raises "does not require grad".
+                            if not chunk_loss.requires_grad:
+                                chunk_loss = chunk_loss + (f_verts * 0).sum()
+                            if not torch.isfinite(chunk_loss).all():
+                                if accelerator.is_main_process:
+                                    print(
+                                        "[Warn] non-finite chunk_loss; using zero backward for this chunk "
+                                        f"(epoch={epoch}, step={step}, vc={vc})"
+                                    )
+                                chunk_loss = (f_verts * 0).sum()
                         
                             accelerator.backward(chunk_loss, retain_graph=not is_last_chunk)
                         

@@ -271,7 +271,9 @@ class Stage2Pipeline(nn.Module):
                                           device=base_verts.device)
             for gf_bk, lc_bk, fidx_bk in auto_buckets:
                 bk_feat, _ = self.encoder(gf_bk, lc_bk)
-                vertex_features[0, fidx_bk[0]] = bk_feat[0]
+                vertex_features[0, fidx_bk[0]] = bk_feat[0].to(
+                    dtype=vertex_features.dtype
+                )            
             trans_feat = None
             if do_log:
                 prof_split(True, t0, "encoder(total)", "pipe")

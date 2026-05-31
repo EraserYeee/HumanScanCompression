@@ -469,7 +469,7 @@ class FaceAutoGrouper(nn.Module):
     4. Triangle parametric coords computed vectorized per bucket.
     """
 
-    BUCKET_SIZES = (256, 512, 1024)
+    BUCKET_SIZES = (256, 512, 1024,2048)
 
     def __init__(self, min_pts: int = 16, knn_chunk_size: int = 512):
         super().__init__()
