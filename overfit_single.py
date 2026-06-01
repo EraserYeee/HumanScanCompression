@@ -247,6 +247,8 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3, help="overfit 用比训练略大的 lr")
     p.add_argument("--w_laplacian", type=float, default=0.0,
                    help="默认关闭，纯测容量上限；设 >0 可加回平滑正则")
+    p.add_argument("--w_seam", type=float, default=0.0,
+                   help="seam consistency 权重；>0 验证能否消除共享边 sliver")
     p.add_argument("--resample_every", type=int, default=0,
                    help=">0 则每隔若干 step 重采样 scan 点（默认 0=固定点云，更易过拟合）")
     p.add_argument("--device", default="cuda")
@@ -334,6 +336,14 @@ def main():
         if args.w_laplacian > 0:
             loss = loss + args.w_laplacian * compute_uniform_laplacian_l1(f_verts[0], f_faces)
 
+        # seam consistency (FaceTriangleDecoder only)
+        seam_val = 0.0
+        if args.w_seam > 0:
+            seam = getattr(model.decoder, "_last_seam_loss", None)
+            if seam is not None:
+                loss = loss + args.w_seam * seam
+                seam_val = float(seam)
+
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -341,7 +351,7 @@ def main():
         if step % 20 == 0 or step == args.steps - 1:
             print(f"[step {step:5d}] loss={float(loss):.5f} "
                   f"normal={detail['normal']:.5f} depth={detail['depth']:.5f} "
-                  f"mask={detail['mask']:.5f} lr={optimizer.param_groups[0]['lr']:.2e}")
+                  f"mask={detail['mask']:.5f} seam={seam_val:.6f} lr={optimizer.param_groups[0]['lr']:.2e}")
 
         if step % args.save_interval == 0 or step == args.steps - 1:
             export_obj(os.path.join(out_dir, f"fine_{step:05d}.obj"), f_verts[0], f_faces)

@@ -26,6 +26,7 @@ loss:
   w_disp: 0.0
   w_laplacian: 0.0
   w_mat: 0.001
+  w_seam: 10.0                # seam consistency: 相邻面共享边位移主动一致, 治 sliver
   w_render: 1.0
   normal_loss_type: geo
   w_depth_l1: 4.0

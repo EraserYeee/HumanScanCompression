@@ -264,6 +264,7 @@ def train(config, args):
                 term_laplacian_batch = 0.0
                 term_disp_batch = 0.0
                 term_mat_batch = 0.0
+                term_seam_batch = 0.0
                 term_kl_batch = 0.0
                 render_full_batch = 0.0
                 render_nd_l1_batch = 0.0
@@ -394,12 +395,23 @@ def train(config, args):
                     else:
                         w_chamfer = 0.0
                         w_render_weight = config['loss']['w_render']
-                
+
+                    # Seam consistency loss (FaceTriangleDecoder only): drives adjacent
+                    # faces to agree on shared-edge displacement, killing edge slivers.
+                    w_seam = config['loss'].get('w_seam', 0.0)
+                    loss_seam = torch.tensor(0.0, device=accelerator.device)
+                    if w_seam > 0:
+                        _dec = accelerator.unwrap_model(model).decoder
+                        _seam = getattr(_dec, '_last_seam_loss', None)
+                        if _seam is not None:
+                            loss_seam = _seam
+
                     loss_non_render = (
                         w_chamfer * loss_chamfer +
                         config['loss']['w_laplacian'] * loss_lap +
                         config['loss']['w_disp'] * loss_disp +
                         w_mat * loss_mat +
+                        w_seam * loss_seam +
                         loss_kl
                     )
                     w_disp_cfg = config['loss'].get('w_disp', 0.0)
@@ -408,6 +420,7 @@ def train(config, args):
                     term_laplacian_batch += (w_lap_cfg * loss_lap).item()
                     term_disp_batch += (w_disp_cfg * loss_disp).item()
                     term_mat_batch += (w_mat * loss_mat).item()
+                    term_seam_batch += (w_seam * loss_seam).item()
                     term_kl_batch += loss_kl.item()
                 
                     # View-chunked rendering with per-chunk backward to save VRAM.
@@ -620,6 +633,7 @@ def train(config, args):
                         "loss/term_laplacian": term_laplacian_batch / bl,
                         "loss/term_disp": term_disp_batch / bl,
                         "loss/term_mat": term_mat_batch / bl,
+                        "loss/term_seam": term_seam_batch / bl,
                         "loss/term_kl": term_kl_batch / bl,
                         "loss/chamfer_raw": loss_chamfer_batch / bl,
                         "loss/laplacian_raw": loss_lap_batch / bl,

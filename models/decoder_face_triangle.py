@@ -174,6 +174,18 @@ class FaceTriangleDecoder(nn.Module):
             disp_stitched_flat = averaged[idx_all]
         disp_stitched = disp_stitched_flat.view(B_batch, -1, 3)
 
+        # --- Seam consistency loss ---
+        # Adjacent faces independently predict displacement on shared edges/vertices.
+        # scatter_mean only *passively* averages them afterwards; under weak/ill-posed
+        # supervision the two sides can disagree wildly, producing edge slivers.
+        # This term *actively* drives the pre-stitch per-face predictions on the same
+        # merge group toward agreement (within-group variance of the raw displacements),
+        # so the edge does not have to be a forced compromise.
+        # Stored as an attribute (no return-signature change) and read by the trainer.
+        seam_avg = scatter_mean(disp_all, idx_all, dim=0)          # (U, 3)
+        seam_resid = disp_all - seam_avg[idx_all]                  # (B*F*K, 3)
+        self._last_seam_loss = (seam_resid ** 2).sum(dim=-1).mean()
+
         if do_log:
             t0 = prof_split(do_log, t0, "face_tri_mlp_stitch", "dec")
 
