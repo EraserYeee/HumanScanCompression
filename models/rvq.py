@@ -104,40 +104,45 @@ class VectorQuantizerEMA(nn.Module):
             loss:      标量    commitment loss
         """
         flatten = x.reshape(-1, self.dim)
+        # 量化路径(最近邻搜索 + EMA 码本更新)不应参与 autograd。
+        # 若这里错误地追踪计算图，会让图跨 step 挂在模块 buffer 上，出现显存缓慢爬升。
+        flatten_detached = flatten.detach()
 
         if self.training and self.initialized.item() == 0.0:
-            self._init_embed_from_data(flatten)
+            self._init_embed_from_data(flatten_detached)
 
-        # L2 距离: ||x - e||^2 = ||x||^2 - 2 x·e + ||e||^2
-        dist = (
-            flatten.pow(2).sum(1, keepdim=True)
-            - 2 * flatten @ self.embed.t()
-            + self.embed.pow(2).sum(1, keepdim=True).t()
-        )                                                          # (M, N)
-        indices = dist.argmin(dim=1)                               # (M,)
+        # L2 最近邻搜索：在 no_grad 下做，避免为 argmin 前的大矩阵建立无用计算图。
+        with torch.no_grad():
+            dist = (
+                flatten_detached.pow(2).sum(1, keepdim=True)
+                - 2 * flatten_detached @ self.embed.t()
+                + self.embed.pow(2).sum(1, keepdim=True).t()
+            )                                                      # (M, N)
+            indices = dist.argmin(dim=1)                           # (M,)
         quantized = self.embed[indices]                            # (M, D)
 
-        # EMA 更新码本(仅训练)
+        # EMA 更新码本(仅训练): 必须 no_grad，且只用 detached 特征统计。
         if self.training:
-            onehot = F.one_hot(indices, self.codebook_size).type(flatten.dtype)  # (M, N)
-            cluster_size_new = onehot.sum(0)                       # (N,)
-            embed_sum = onehot.t() @ flatten                       # (N, D)
+            with torch.no_grad():
+                onehot = F.one_hot(indices, self.codebook_size).type(flatten_detached.dtype)  # (M, N)
+                cluster_size_new = onehot.sum(0)                   # (N,)
+                embed_sum = onehot.t() @ flatten_detached          # (N, D)
 
-            self.cluster_size.mul_(self.decay).add_(
-                cluster_size_new, alpha=1 - self.decay
-            )
-            self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
+                self.cluster_size.mul_(self.decay).add_(
+                    cluster_size_new, alpha=1 - self.decay
+                )
+                self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
 
-            # laplace smoothing 归一化
-            n = self.cluster_size.sum()
-            cluster_size = (
-                (self.cluster_size + self.eps)
-                / (n + self.codebook_size * self.eps)
-                * n
-            )
-            self.embed.copy_(self.embed_avg / cluster_size.unsqueeze(1))
+                # laplace smoothing 归一化
+                n = self.cluster_size.sum()
+                cluster_size = (
+                    (self.cluster_size + self.eps)
+                    / (n + self.codebook_size * self.eps)
+                    * n
+                )
+                self.embed.copy_(self.embed_avg / cluster_size.unsqueeze(1))
 
-            self._expire_dead_codes(flatten)
+                self._expire_dead_codes(flatten_detached)
 
         # commitment loss: 把 encoder 输出拉向码字(码字不靠梯度更新, 故 detach)
         loss = self.commitment_weight * F.mse_loss(quantized.detach(), flatten)

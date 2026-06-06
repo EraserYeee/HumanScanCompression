@@ -1,6 +1,6 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import time
 import torch
 import torch.nn.functional as F
@@ -609,6 +609,15 @@ def train(config, args):
                     loss_mat_batch += loss_mat.item()
                     loss_kl_batch += loss_kl.item()
                 
+                    # 及时清理 pipeline/decoder 上缓存的本次前向张量引用，防止跨 step 挂图。
+                    _model_now = accelerator.unwrap_model(model)
+                    if hasattr(_model_now, '_last_vq_loss'):
+                        _model_now._last_vq_loss = None
+                    if hasattr(_model_now, '_last_rvq_indices'):
+                        _model_now._last_rvq_indices = None
+                    if hasattr(_model_now, 'decoder') and hasattr(_model_now.decoder, '_last_seam_loss'):
+                        _model_now.decoder._last_seam_loss = None
+
                     # Delete large tensors to free memory immediately
                     del f_verts, f_faces, disp, trans_feat, vertex_features
                     if model_kl_loss is not None:

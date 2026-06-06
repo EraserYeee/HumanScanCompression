@@ -61,7 +61,7 @@ model:
   pt_sa_pe_frequencies: 4       # sinusoidal PE frequency bands
 
   # --- Shared model settings ---
-  feature_dim: 512
+  feature_dim: 384
   use_scan_normal: true
   use_feature_transform: false
   predict_offset: false
@@ -70,7 +70,7 @@ model:
 
   # --- Decoder ---
   decoder_type: sum_of_feature
-  dec_hidden_dim: [512, 256, 128, 64]
+  dec_hidden_dim: [128, 64]
   subdivision_levels: 8
   subdivision_rate: 14
 
@@ -82,8 +82,8 @@ model:
   # 把"由粗到细分层"放进 latent 空间: 第1层抓低频整体位移, 后层抓细节;
   # 存的是码字索引(每层 log2(N) bit)而非连续 feature, 是压缩率的真正来源。
   # 几何路径不变(fine_verts = lp + disp 一次成型), 解码端并行求和, 无自回归。
-  use_rvq: false
-  rvq_num_quantizers: 8         # 层数 Q: 压缩率/精度权衡, 也是分层层数
+  use_rvq: true
+  rvq_num_quantizers: 4         # 层数 Q: 压缩率/精度权衡, 也是分层层数
   rvq_codebook_size: 2048       # 每层码本大小 N -> log2(2048)=11 bit/层/anchor
   rvq_decay: 0.99               # 码本 EMA 衰减
   rvq_commitment_weight: 0.25   # 单层 commitment 权重(再乘 loss.w_vq)
