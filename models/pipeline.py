@@ -13,6 +13,7 @@ from .encoder import (
 from .decoder import NeuralSubdivisionDecoder
 from .decoder_sumof_feature import SumOfFeatureDecoder
 from .decoder_face_triangle import FaceTriangleDecoder
+from .rvq import ResidualVQ
 
 class Stage2Pipeline(nn.Module):
     """
@@ -141,6 +142,33 @@ class Stage2Pipeline(nn.Module):
         else:
             self.vae_head = None
             decoder_feature_dim = config.get('feature_dim', 128)
+
+        # === Residual VQ (optional, decoupled) ===
+        # 插在 encoder(/VAE) 与 decoder 之间, 把"由粗到细分层"放进 latent 空间:
+        # 第 1 层抓低频整体位移, 后层抓细节; 存储的是码字索引而非连续 feature。
+        # 关掉时(use_rvq=False)不构造, 对现有训练零影响。
+        self.use_rvq = config.get('use_rvq', False)
+        if self.use_rvq:
+            self.rvq = ResidualVQ(
+                dim=decoder_feature_dim,
+                num_quantizers=config.get('rvq_num_quantizers', 8),
+                codebook_size=config.get('rvq_codebook_size', 2048),
+                decay=config.get('rvq_decay', 0.99),
+                commitment_weight=config.get('rvq_commitment_weight', 0.25),
+                threshold_dead=config.get('rvq_threshold_dead', 1.0),
+            )
+            # 渐进式层激活: 训练中由外部(train loop)设置 self._rvq_num_active;
+            # None 表示用满 num_quantizers 层。
+            self._rvq_num_active = None
+            print(
+                f"RVQ enabled: dim={decoder_feature_dim}, "
+                f"Q={config.get('rvq_num_quantizers', 8)}, "
+                f"N={config.get('rvq_codebook_size', 2048)}"
+            )
+        else:
+            self.rvq = None
+        self._last_vq_loss = None
+        self._last_rvq_indices = None
         
         # === Decoder Selection ===
         decoder_type = config.get('decoder_type', 'standard')
@@ -332,6 +360,20 @@ class Stage2Pipeline(nn.Module):
             vertex_features, kl_loss = self.vae_head(vertex_features)
             if do_log:
                 prof_split(True, t0, "vae_head", "pipe")
+
+        # 2.6 Residual VQ (optional): 分层量化, 损失走属性通道(_last_vq_loss),
+        # 不改变本 forward 的返回签名(保持与 infer/overfit 的 6 元组解包兼容)。
+        self._last_vq_loss = None
+        self._last_rvq_indices = None
+        if self.rvq is not None:
+            t0 = prof_start() if do_log else None
+            vertex_features, rvq_indices, vq_loss = self.rvq(
+                vertex_features, num_active=self._rvq_num_active
+            )
+            self._last_vq_loss = vq_loss
+            self._last_rvq_indices = rvq_indices
+            if do_log:
+                prof_split(True, t0, "rvq", "pipe")
 
         # 3. Decoding
         t0 = prof_start() if do_log else None

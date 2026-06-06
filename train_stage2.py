@@ -221,6 +221,23 @@ def train(config, args):
     step = start_epoch * len(dataloader)
     for epoch in range(start_epoch, epochs):
         oom_count = 0
+
+        # === Progressive RVQ: 逐 epoch 激活更多量化层(从 1 增到 Q), 稳定训练 ===
+        # rvq_warmup_epochs 内线性增加 num_active; 之后用满 Q 层。
+        _rvq_mod = accelerator.unwrap_model(model)
+        if getattr(_rvq_mod, 'rvq', None) is not None:
+            _q_total = _rvq_mod.rvq.num_quantizers
+            _rvq_warmup = config['loss'].get('rvq_warmup_epochs', 0)
+            if _rvq_warmup > 0 and epoch < _rvq_warmup:
+                # epoch 0 时至少 1 层, 线性增长到 _q_total
+                _num_active = 1 + int((_q_total - 1) * epoch / max(_rvq_warmup, 1))
+                _num_active = max(1, min(_num_active, _q_total))
+            else:
+                _num_active = _q_total
+            _rvq_mod._rvq_num_active = _num_active
+            if accelerator.is_main_process:
+                print(f"[RVQ] epoch {epoch}: num_active = {_num_active}/{_q_total}")
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", disable=not accelerator.is_local_main_process)
         
         t_end = time.time()
@@ -266,6 +283,7 @@ def train(config, args):
                 term_mat_batch = 0.0
                 term_seam_batch = 0.0
                 term_kl_batch = 0.0
+                term_vq_batch = 0.0
                 render_full_batch = 0.0
                 render_nd_l1_batch = 0.0
                 
@@ -406,12 +424,22 @@ def train(config, args):
                         if _seam is not None:
                             loss_seam = _seam
 
+                    # RVQ commitment loss (only when use_rvq): 走 pipeline 属性通道,
+                    # 仿 seam loss 读取, 不改 pipeline 返回签名。
+                    w_vq = config['loss'].get('w_vq', 0.0)
+                    loss_vq = torch.tensor(0.0, device=accelerator.device)
+                    if w_vq > 0:
+                        _vq = getattr(accelerator.unwrap_model(model), '_last_vq_loss', None)
+                        if _vq is not None:
+                            loss_vq = _vq
+
                     loss_non_render = (
                         w_chamfer * loss_chamfer +
                         config['loss']['w_laplacian'] * loss_lap +
                         config['loss']['w_disp'] * loss_disp +
                         w_mat * loss_mat +
                         w_seam * loss_seam +
+                        w_vq * loss_vq +
                         loss_kl
                     )
                     w_disp_cfg = config['loss'].get('w_disp', 0.0)
@@ -421,6 +449,7 @@ def train(config, args):
                     term_disp_batch += (w_disp_cfg * loss_disp).item()
                     term_mat_batch += (w_mat * loss_mat).item()
                     term_seam_batch += (w_seam * loss_seam).item()
+                    term_vq_batch += (w_vq * loss_vq).item() if torch.is_tensor(loss_vq) else 0.0
                     term_kl_batch += loss_kl.item()
                 
                     # View-chunked rendering with per-chunk backward to save VRAM.
@@ -634,6 +663,7 @@ def train(config, args):
                         "loss/term_disp": term_disp_batch / bl,
                         "loss/term_mat": term_mat_batch / bl,
                         "loss/term_seam": term_seam_batch / bl,
+                        "loss/term_vq": term_vq_batch / bl,
                         "loss/term_kl": term_kl_batch / bl,
                         "loss/chamfer_raw": loss_chamfer_batch / bl,
                         "loss/laplacian_raw": loss_lap_batch / bl,
@@ -721,8 +751,22 @@ def train(config, args):
                                       f"ratio: {avg_diag.get('ca_residual_to_coarse_ratio', 0):.6f}")
                             print()
                     
+                    # RVQ codebook usage 诊断(监控 dead-code): 每层被激活码字占比
+                    _rvq_diag = accelerator.unwrap_model(model)
+                    if getattr(_rvq_diag, 'rvq', None) is not None:
+                        try:
+                            _usage = _rvq_diag.rvq.codebook_usage()
+                            for _li, _u in enumerate(_usage):
+                                log_dict[f"rvq/usage_layer{_li}"] = _u
+                            log_dict["rvq/num_active"] = float(
+                                getattr(_rvq_diag, '_rvq_num_active', None)
+                                or _rvq_diag.rvq.num_quantizers
+                            )
+                        except Exception:
+                            pass
+
                     accelerator.log(log_dict, step=step)
-                    
+
                     # Clear diagnostics list after logging
                     diagnostics_list.clear()
                     

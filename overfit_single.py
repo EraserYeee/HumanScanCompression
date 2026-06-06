@@ -249,6 +249,12 @@ def main():
                    help="默认关闭，纯测容量上限；设 >0 可加回平滑正则")
     p.add_argument("--w_seam", type=float, default=0.0,
                    help="seam consistency 权重；>0 验证能否消除共享边 sliver")
+    p.add_argument("--use_rvq", action="store_true",
+                   help="启用 Residual VQ 分层量化(latent 空间由粗到细)")
+    p.add_argument("--w_vq", type=float, default=1.0,
+                   help="RVQ commitment loss 权重(仅 --use_rvq 时生效)")
+    p.add_argument("--rvq_num_quantizers", type=int, default=8, help="RVQ 层数 Q")
+    p.add_argument("--rvq_codebook_size", type=int, default=2048, help="RVQ 每层码本大小 N")
     p.add_argument("--resample_every", type=int, default=0,
                    help=">0 则每隔若干 step 重采样 scan 点（默认 0=固定点云，更易过拟合）")
     p.add_argument("--device", default="cuda")
@@ -274,6 +280,11 @@ def main():
     if args.image_size is not None:
         cfg["render"]["image_size"] = args.image_size
     cfg["loss"]["w_laplacian"] = args.w_laplacian
+    if args.use_rvq:
+        model_cfg["use_rvq"] = True
+        model_cfg["rvq_num_quantizers"] = args.rvq_num_quantizers
+        model_cfg["rvq_codebook_size"] = args.rvq_codebook_size
+        print(f"[RVQ] enabled: Q={args.rvq_num_quantizers} N={args.rvq_codebook_size} w_vq={args.w_vq}")
 
     tag = f"{args.preset}_fd{model_cfg['feature_dim']}_lv{model_cfg['subdivision_levels']}"
     out_dir = os.path.join(args.output_dir, tag)
@@ -344,6 +355,14 @@ def main():
                 loss = loss + args.w_seam * seam
                 seam_val = float(seam)
 
+        # RVQ commitment loss (only when --use_rvq)
+        vq_val = 0.0
+        if args.use_rvq and args.w_vq > 0:
+            vq = getattr(model, "_last_vq_loss", None)
+            if vq is not None:
+                loss = loss + args.w_vq * vq
+                vq_val = float(vq)
+
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -351,7 +370,7 @@ def main():
         if step % 20 == 0 or step == args.steps - 1:
             print(f"[step {step:5d}] loss={float(loss):.5f} "
                   f"normal={detail['normal']:.5f} depth={detail['depth']:.5f} "
-                  f"mask={detail['mask']:.5f} seam={seam_val:.6f} lr={optimizer.param_groups[0]['lr']:.2e}")
+                  f"mask={detail['mask']:.5f} seam={seam_val:.6f} vq={vq_val:.6f} lr={optimizer.param_groups[0]['lr']:.2e}")
 
         if step % args.save_interval == 0 or step == args.steps - 1:
             export_obj(os.path.join(out_dir, f"fine_{step:05d}.obj"), f_verts[0], f_faces)

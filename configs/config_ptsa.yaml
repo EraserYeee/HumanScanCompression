@@ -27,6 +27,8 @@ loss:
   w_laplacian: 0.0
   w_mat: 0.001
   w_seam: 10.0                # seam consistency: 相邻面共享边位移主动一致, 治 sliver
+  w_vq: 1.0                   # RVQ commitment loss 权重(仅 use_rvq=true 时生效)
+  rvq_warmup_epochs: 0        # >0 时前若干 epoch 渐进激活量化层(1→Q), 稳训练
   w_render: 1.0
   normal_loss_type: geo
   w_depth_l1: 4.0
@@ -75,6 +77,17 @@ model:
   # --- VAE (disabled) ---
   use_vae: false
   vae_latent_dim: 40
+
+  # --- Residual VQ (disabled by default) ---
+  # 把"由粗到细分层"放进 latent 空间: 第1层抓低频整体位移, 后层抓细节;
+  # 存的是码字索引(每层 log2(N) bit)而非连续 feature, 是压缩率的真正来源。
+  # 几何路径不变(fine_verts = lp + disp 一次成型), 解码端并行求和, 无自回归。
+  use_rvq: false
+  rvq_num_quantizers: 8         # 层数 Q: 压缩率/精度权衡, 也是分层层数
+  rvq_codebook_size: 2048       # 每层码本大小 N -> log2(2048)=11 bit/层/anchor
+  rvq_decay: 0.99               # 码本 EMA 衰减
+  rvq_commitment_weight: 0.25   # 单层 commitment 权重(再乘 loss.w_vq)
+  rvq_threshold_dead: 1.0       # cluster_size 低于此值的码字触发 dead-code 重启
 render:
   dist_multiplier: 0.4
   image_size: 512
