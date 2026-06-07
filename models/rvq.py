@@ -49,6 +49,7 @@ class VectorQuantizerEMA(nn.Module):
         eps: float = 1e-5,
         commitment_weight: float = 0.25,
         threshold_dead: float = 1.0,
+        dead_code_warmup_steps: int = 1000,
     ):
         super().__init__()
         self.dim = dim
@@ -57,6 +58,7 @@ class VectorQuantizerEMA(nn.Module):
         self.eps = eps
         self.commitment_weight = commitment_weight
         self.threshold_dead = threshold_dead
+        self.dead_code_warmup_steps = dead_code_warmup_steps
 
         # 码本作为 buffer(非参数, 靠 EMA 更新), 随 state_dict 保存/加载
         embed = torch.randn(codebook_size, dim)
@@ -64,6 +66,8 @@ class VectorQuantizerEMA(nn.Module):
         self.register_buffer("cluster_size", torch.zeros(codebook_size))   # (N,)
         self.register_buffer("embed_avg", embed.clone())            # (N, D)
         self.register_buffer("initialized", torch.tensor(0.0))      # 是否已用数据初始化
+        # 训练 step 计数(仅训练分支自增), 用于 dead-code warmup。
+        self.register_buffer("step_count", torch.tensor(0, dtype=torch.long))
 
     @torch.no_grad()
     def _init_embed_from_data(self, x: torch.Tensor):
@@ -99,9 +103,15 @@ class VectorQuantizerEMA(nn.Module):
         Args:
             x: (M, D) 扁平化后的待量化向量
         Returns:
-            quantized: (M, D) 量化后向量(带 STE 直通梯度)
+            quantized: (M, D) 量化后向量(**未做 STE**, 由外层 ResidualVQ 统一处理)
             indices:   (M,)   码字索引
             loss:      标量    commitment loss
+
+        重要约定:
+            - 这里只返回 "纯量化值" e(q), 不做单层 STE。
+            - 单层 STE 会让 ResidualVQ 累加后梯度被放大 num_active 倍, encoder 梯度爆。
+            - STE 由 ResidualVQ.forward 在所有层求和后做一次 (d z_hat / d z = 1)。
+            - commitment loss 仍在本层计算: encoder 输出(此层为 residual) 应靠近自己被指派到的码字。
         """
         flatten = x.reshape(-1, self.dim)
         # 量化路径(最近邻搜索 + EMA 码本更新)不应参与 autograd。
@@ -119,7 +129,7 @@ class VectorQuantizerEMA(nn.Module):
                 + self.embed.pow(2).sum(1, keepdim=True).t()
             )                                                      # (M, N)
             indices = dist.argmin(dim=1)                           # (M,)
-        quantized = self.embed[indices]                            # (M, D)
+        quantized = self.embed[indices]                            # (M, D)  注: embed 是 buffer 不带梯度
 
         # EMA 更新码本(仅训练): 必须 no_grad，且只用 detached 特征统计。
         if self.training:
@@ -142,13 +152,18 @@ class VectorQuantizerEMA(nn.Module):
                 )
                 self.embed.copy_(self.embed_avg / cluster_size.unsqueeze(1))
 
-                self._expire_dead_codes(flatten_detached)
+                # dead-code 重启需要 warmup: 训练初期 cluster_size 还没爬起来,
+                # 立刻判死会把整个码本疯狂洗牌, 码字漂移加剧不稳定。
+                self.step_count.add_(1)
+                if int(self.step_count.item()) > self.dead_code_warmup_steps:
+                    self._expire_dead_codes(flatten_detached)
 
-        # commitment loss: 把 encoder 输出拉向码字(码字不靠梯度更新, 故 detach)
+        # commitment loss: 把 encoder 输出(本层输入 residual) 拉向被指派的码字
+        # (码字不靠梯度更新, 故 detach)
         loss = self.commitment_weight * F.mse_loss(quantized.detach(), flatten)
 
-        # STE 直通: 前向用 quantized, 反向梯度直达 flatten
-        quantized = flatten + (quantized - flatten).detach()
+        # 关键: 此处 **不做 STE**。返回 "纯 e(q)" 给上层 ResidualVQ 累加。
+        # ResidualVQ 在求和后做一次统一 STE, 保证 d z_hat / d z = 1。
         return quantized, indices, loss
 
 
@@ -170,6 +185,7 @@ class ResidualVQ(nn.Module):
         decay: float = 0.99,
         commitment_weight: float = 0.25,
         threshold_dead: float = 1.0,
+        dead_code_warmup_steps: int = 1000,
     ):
         super().__init__()
         self.dim = dim
@@ -183,6 +199,7 @@ class ResidualVQ(nn.Module):
                     decay=decay,
                     commitment_weight=commitment_weight,
                     threshold_dead=threshold_dead,
+                    dead_code_warmup_steps=dead_code_warmup_steps,
                 )
                 for _ in range(num_quantizers)
             ]
@@ -194,9 +211,15 @@ class ResidualVQ(nn.Module):
             z: (B, N, D) 连续特征 (encoder 输出)
             num_active: 本次激活的层数(渐进式训练用); None 表示全部 Q 层
         Returns:
-            z_hat:   (B, N, D) 重建特征(带 STE 直通梯度)
+            z_hat:   (B, N, D) 重建特征(带 STE 直通梯度, d z_hat / d z = 1)
             indices: (B, N, num_active) 各层码字索引(long), 用于压缩存储 / 比特统计
-            vq_loss: 标量, 各激活层 commitment loss 之和
+            vq_loss: 标量, 各激活层 commitment loss 的均值
+
+        梯度合约(关键修复, 见单层 forward 注释):
+            - 单层 VQ 不做 STE, 返回纯 e(q_i)。
+            - z_hat_sum = Σ_i e(q_i)  (前向值: 每层逼近残差, 累加约等于原 z)
+            - 在外层做一次统一 STE: z_hat = flat + (z_hat_sum - flat).detach()
+            - 这样 d z_hat / d flat = 1, 与单层 VQ 直觉一致, 不会随 num_active 放大。
         """
         if num_active is None:
             num_active = self.num_quantizers
@@ -205,21 +228,30 @@ class ResidualVQ(nn.Module):
         B, N, D = z.shape
         flat = z.reshape(-1, D)                                    # (B*N, D)
 
+        # residual 必须保留对 flat 的梯度: 这样每层 commitment loss
+        #   loss_i = mse(e(q_i).detach(), residual_i)
+        # 才能把梯度传回 encoder, 把 encoder 输出拉向各层码字。
+        # 由于 quantized 本身已 detach(单层 VQ 不再做 STE), residual = flat - Σ q_j.detach()
+        # 对 flat 的梯度恒为 1, 各层 commitment loss 都能正确反传。
         residual = flat
-        z_hat = torch.zeros_like(flat)
+        z_hat_sum = torch.zeros_like(flat)                         # 求和值, 由 codebook 查得无梯度
         vq_loss = z.new_tensor(0.0)
         idx_list = []
 
         for i in range(num_active):
             quantized, indices, loss = self.layers[i](residual)
-            # 残差更新: 用 detach 的 quantized 计算残差(标准 RVQ 做法,
-            # 避免梯度在层间反复纠缠; STE 已保证 z_hat 对 flat 有梯度)
+            # quantized 来自 buffer 查表, 本身就不带梯度; 这里 detach 一次保险。
             residual = residual - quantized.detach()
-            z_hat = z_hat + quantized
+            z_hat_sum = z_hat_sum + quantized
             vq_loss = vq_loss + loss
             idx_list.append(indices)
 
         vq_loss = vq_loss / num_active
+
+        # 统一 STE: z_hat 前向 = 各层量化值之和, 反向把 render 梯度 1:1 直通到 flat。
+        # 这是 RVQ 在重建/压缩任务上的标准做法, 避免 d z_hat / d flat = num_active 放大。
+        z_hat = flat + (z_hat_sum - flat).detach()
+
         indices = torch.stack(idx_list, dim=-1)                    # (B*N, num_active)
         z_hat = z_hat.reshape(B, N, D)
         indices = indices.reshape(B, N, num_active)

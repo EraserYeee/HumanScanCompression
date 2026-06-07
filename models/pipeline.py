@@ -156,6 +156,7 @@ class Stage2Pipeline(nn.Module):
                 decay=config.get('rvq_decay', 0.99),
                 commitment_weight=config.get('rvq_commitment_weight', 0.25),
                 threshold_dead=config.get('rvq_threshold_dead', 1.0),
+                dead_code_warmup_steps=config.get('rvq_dead_code_warmup_steps', 1000),
             )
             # 渐进式层激活: 训练中由外部(train loop)设置 self._rvq_num_active;
             # None 表示用满 num_quantizers 层。

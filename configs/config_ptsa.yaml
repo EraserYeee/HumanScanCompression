@@ -88,6 +88,7 @@ model:
   rvq_decay: 0.99               # 码本 EMA 衰减
   rvq_commitment_weight: 0.25   # 单层 commitment 权重(再乘 loss.w_vq)
   rvq_threshold_dead: 1.0       # cluster_size 低于此值的码字触发 dead-code 重启
+  rvq_dead_code_warmup_steps: 1000   # 前 1000 step 不重启死码字, 让 cluster_size 先爬起来
 render:
   dist_multiplier: 0.4
   image_size: 512
