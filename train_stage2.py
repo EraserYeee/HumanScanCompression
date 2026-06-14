@@ -282,6 +282,7 @@ def train(config, args):
                 term_disp_batch = 0.0
                 term_mat_batch = 0.0
                 term_seam_batch = 0.0
+                term_base_disp_batch = 0.0
                 term_kl_batch = 0.0
                 term_vq_batch = 0.0
                 render_full_batch = 0.0
@@ -433,12 +434,22 @@ def train(config, args):
                         if _vq is not None:
                             loss_vq = _vq
 
+                    # Base vertex displacement magnitude regularizer (only when
+                    # use_base_displacement): 防 base 大位移翻面, 走属性通道读取。
+                    w_base_disp_reg = config['loss'].get('w_base_disp_reg', 0.0)
+                    loss_base_disp = torch.tensor(0.0, device=accelerator.device)
+                    if w_base_disp_reg > 0:
+                        _bd = getattr(accelerator.unwrap_model(model), '_last_base_disp_reg', None)
+                        if _bd is not None:
+                            loss_base_disp = _bd
+
                     loss_non_render = (
                         w_chamfer * loss_chamfer +
                         config['loss']['w_laplacian'] * loss_lap +
                         config['loss']['w_disp'] * loss_disp +
                         w_mat * loss_mat +
                         w_seam * loss_seam +
+                        w_base_disp_reg * loss_base_disp +
                         w_vq * loss_vq +
                         loss_kl
                     )
@@ -449,6 +460,7 @@ def train(config, args):
                     term_disp_batch += (w_disp_cfg * loss_disp).item()
                     term_mat_batch += (w_mat * loss_mat).item()
                     term_seam_batch += (w_seam * loss_seam).item()
+                    term_base_disp_batch += (w_base_disp_reg * loss_base_disp).item() if torch.is_tensor(loss_base_disp) else 0.0
                     term_vq_batch += (w_vq * loss_vq).item() if torch.is_tensor(loss_vq) else 0.0
                     term_kl_batch += loss_kl.item()
                 
@@ -615,6 +627,10 @@ def train(config, args):
                         _model_now._last_vq_loss = None
                     if hasattr(_model_now, '_last_rvq_indices'):
                         _model_now._last_rvq_indices = None
+                    if hasattr(_model_now, '_last_base_disp'):
+                        _model_now._last_base_disp = None
+                    if hasattr(_model_now, '_last_base_disp_reg'):
+                        _model_now._last_base_disp_reg = None
                     if hasattr(_model_now, 'decoder') and hasattr(_model_now.decoder, '_last_seam_loss'):
                         _model_now.decoder._last_seam_loss = None
 
@@ -630,6 +646,12 @@ def train(config, args):
                         del f_faces_expanded
                     del loss_non_render, loss_chamfer, loss_lap, loss_disp, loss_mat, loss_kl
                 
+                # Gradient clipping: 防 RVQ 崩塌/位移爆炸后一次大梯度被动量带飞而无法恢复。
+                # <=0 或缺省则不裁剪(保持其他 config 的原行为)。
+                _grad_clip = config.get('train', {}).get('grad_clip_norm', None)
+                if _grad_clip is not None and float(_grad_clip) > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), float(_grad_clip))
+
                 optimizer.step()
 
                 if accelerator.is_main_process and profile_timing and (train_profile_batch_i % profile_interval == 0):
@@ -672,6 +694,7 @@ def train(config, args):
                         "loss/term_disp": term_disp_batch / bl,
                         "loss/term_mat": term_mat_batch / bl,
                         "loss/term_seam": term_seam_batch / bl,
+                        "loss/term_base_disp": term_base_disp_batch / bl,
                         "loss/term_vq": term_vq_batch / bl,
                         "loss/term_kl": term_kl_batch / bl,
                         "loss/chamfer_raw": loss_chamfer_batch / bl,
@@ -773,6 +796,13 @@ def train(config, args):
                             )
                         except Exception:
                             pass
+                    # 崩塌前兆监控(详见 plan Part 1.3): 量化重建误差 + 量化前特征范数
+                    _recon_err = getattr(_rvq_diag, '_last_rvq_recon_err', None)
+                    if _recon_err is not None:
+                        log_dict["rvq/recon_err"] = float(_recon_err)
+                    _feat_norm = getattr(_rvq_diag, '_last_feat_norm', None)
+                    if _feat_norm is not None:
+                        log_dict["rvq/feat_norm"] = float(_feat_norm)
 
                     accelerator.log(log_dict, step=step)
 

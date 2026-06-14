@@ -14,6 +14,7 @@ from .decoder import NeuralSubdivisionDecoder
 from .decoder_sumof_feature import SumOfFeatureDecoder
 from .decoder_face_triangle import FaceTriangleDecoder
 from .rvq import ResidualVQ
+from .base_displacement import BaseVertexDisplacementHead
 
 class Stage2Pipeline(nn.Module):
     """
@@ -170,6 +171,29 @@ class Stage2Pipeline(nn.Module):
             self.rvq = None
         self._last_vq_loss = None
         self._last_rvq_indices = None
+        # RVQ / feature 诊断标量(供 train loop 写日志, 监控崩塌前兆)
+        self._last_rvq_recon_err = None
+        self._last_feat_norm = None
+
+        # === Base Vertex Displacement Head (2.6 轻量两段式, 可选, 解耦) ===
+        # 先把 base 顶点"掰正"到更贴合 scan 的位置, fine decoder 再在 corrected
+        # base 上细分位移。与 fine decoder 权重独立。详见 plan 文档 Part 2。
+        self.use_base_displacement = config.get('use_base_displacement', False)
+        if self.use_base_displacement:
+            self.base_disp_head = BaseVertexDisplacementHead(
+                feature_dim=decoder_feature_dim,
+                hidden_dim=config.get('base_disp_hidden_dim', [128, 64]),
+                init_scale=config.get('base_disp_init_scale', 1e-4),
+                use_normal=config.get('base_disp_use_normal', True),
+            )
+            print(
+                f"BaseVertexDisplacementHead enabled (feature_dim={decoder_feature_dim}, "
+                f"reencode=False [2.6 lightweight tier])"
+            )
+        else:
+            self.base_disp_head = None
+        self._last_base_disp = None
+        self._last_base_disp_reg = None
         
         # === Decoder Selection ===
         decoder_type = config.get('decoder_type', 'standard')
@@ -366,19 +390,48 @@ class Stage2Pipeline(nn.Module):
         # 不改变本 forward 的返回签名(保持与 infer/overfit 的 6 元组解包兼容)。
         self._last_vq_loss = None
         self._last_rvq_indices = None
+        self._last_rvq_recon_err = None
+        self._last_feat_norm = None
         if self.rvq is not None:
             t0 = prof_start() if do_log else None
+            # 崩塌监控: 量化前特征范数 + 量化重建误差(详见 plan Part 1.3)
+            with torch.no_grad():
+                feat_pre = vertex_features
+                self._last_feat_norm = feat_pre.detach().norm(dim=-1).mean()
             vertex_features, rvq_indices, vq_loss = self.rvq(
                 vertex_features, num_active=self._rvq_num_active
             )
             self._last_vq_loss = vq_loss
             self._last_rvq_indices = rvq_indices
+            with torch.no_grad():
+                self._last_rvq_recon_err = (
+                    (vertex_features.detach() - feat_pre.detach()).norm(dim=-1).mean()
+                )
             if do_log:
                 prof_split(True, t0, "rvq", "pipe")
+        else:
+            with torch.no_grad():
+                self._last_feat_norm = vertex_features.detach().norm(dim=-1).mean()
 
-        # 3. Decoding
+        # 2.7 Base Vertex Displacement (optional, 2.6 轻量档): 先移 base 顶点,
+        # fine decoder 在 corrected base 上细分。face features **不** re-encode。
+        self._last_base_disp = None
+        self._last_base_disp_reg = None
+        decode_base_verts = base_verts
+        if self.base_disp_head is not None:
+            t0 = prof_start() if do_log else None
+            base_disp = self.base_disp_head(
+                base_verts, base_faces, vertex_features, base_normals
+            )
+            decode_base_verts = base_verts + base_disp
+            self._last_base_disp = base_disp
+            self._last_base_disp_reg = (base_disp ** 2).sum(dim=-1).mean()
+            if do_log:
+                prof_split(True, t0, "base_disp_head", "pipe")
+
+        # 3. Decoding (在 corrected base 上细分; lp / face basis 随 base 位移更新)
         t0 = prof_start() if do_log else None
-        fine_verts, fine_faces, displacements = self.decoder(base_verts, base_faces, vertex_features, base_normals)
+        fine_verts, fine_faces, displacements = self.decoder(decode_base_verts, base_faces, vertex_features, base_normals)
         if do_log:
             prof_split(True, t0, "decoder(total)", "pipe")
 

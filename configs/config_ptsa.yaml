@@ -27,6 +27,7 @@ loss:
   w_laplacian: 0.0
   w_mat: 0.001
   w_seam: 10.0                # seam consistency: 相邻面共享边位移主动一致, 治 sliver
+  w_base_disp_reg: 0.0        # base 顶点位移幅度正则(>0 启用, 防翻面; 仅 use_base_displacement)
   w_vq: 1.0                   # RVQ commitment loss 权重(仅 use_rvq=true 时生效)
   rvq_warmup_epochs: 0        # >0 时前若干 epoch 渐进激活量化层(1→Q), 稳训练
   w_render: 1.0
@@ -74,6 +75,14 @@ model:
   subdivision_levels: 8
   subdivision_rate: 14
 
+  # --- Base Vertex Displacement (2.6 轻量两段式; 详见 plan 文档 Part 2.6) ---
+  # 先把 base 顶点掰正再细分, fine decoder 在 corrected base 上做小残差位移。
+  # 与 fine decoder 权重独立; face features 暂不 re-encode(轻量档 A/B)。
+  use_base_displacement: true
+  base_disp_hidden_dim: [128, 64]
+  base_disp_init_scale: 1.0e-4   # 末层 near-zero, step 0 时 corrected_base≈base
+  base_disp_use_normal: true
+
   # --- VAE (disabled) ---
   use_vae: false
   vae_latent_dim: 40
@@ -107,5 +116,6 @@ train:
   lr: 5.0e-04
   save_interval: 3
   weight_decay: 1.0e-05
+  grad_clip_norm: 1.0          # 梯度裁剪(防 RVQ 崩塌后发散; <=0 或缺省则不裁剪)
   profile_timing: false
   profile_timing_interval: 50
