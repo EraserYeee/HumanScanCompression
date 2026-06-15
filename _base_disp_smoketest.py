@@ -83,14 +83,16 @@ def test_head_isolated():
     print("  [OK] gradients flow to head + face features")
 
 
-def test_pipeline_forward_backward():
-    print("[test] Stage2Pipeline forward/backward (use_base_displacement) ...")
+def _run_pipeline_case(reencode: bool):
+    tier = "full (re-encode)" if reencode else "2.6 lightweight"
+    print(f"[test] Stage2Pipeline forward/backward (use_base_displacement, {tier}) ...")
     cfg_path = os.path.join(os.path.dirname(__file__), "configs", "config_ptsa.yaml")
     config = load_config(cfg_path)
     mcfg = config["model"]
     # 缩小以加速冒烟
     mcfg["subdivision_rate"] = 4
     mcfg["use_base_displacement"] = True
+    mcfg["base_disp_reencode"] = reencode
     assert mcfg.get("encoding_mode") == "face", "smoke test 假设 encoding_mode=face"
 
     torch.manual_seed(0)
@@ -126,13 +128,23 @@ def test_pipeline_forward_backward():
         loss = loss + model._last_vq_loss
     loss.backward()
 
-    head_grad = None
+    head_grad = 0.0
+    seen = False
     for p in model.base_disp_head.parameters():
         if p.grad is not None:
-            head_grad = p.grad.norm().item() if head_grad is None else head_grad + p.grad.norm().item()
-    assert head_grad is not None, "base_disp_head got no gradient"
+            head_grad += p.grad.norm().item()
+            seen = True
+    assert seen, "base_disp_head got no gradient"
     assert math.isfinite(head_grad), "base_disp_head grad not finite"
-    print(f"  [OK] base_disp_head total grad norm = {head_grad:.4e} (>0 means wired e2e)")
+    assert head_grad > 0, "base_disp_head grad is exactly 0 (not wired e2e)"
+    src = "pass-1 feats + re-encoded fine feats" if reencode else "post-RVQ feats + decoder lp/basis"
+    print(f"  [OK] base_disp_head total grad norm = {head_grad:.4e} (grad src: {src})")
+
+
+def test_pipeline_forward_backward():
+    _run_pipeline_case(reencode=False)
+    print()
+    _run_pipeline_case(reencode=True)
 
 
 def test_pipeline_disabled():

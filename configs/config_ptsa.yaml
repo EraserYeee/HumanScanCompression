@@ -79,6 +79,7 @@ model:
   # 先把 base 顶点掰正再细分, fine decoder 在 corrected base 上做小残差位移。
   # 与 fine decoder 权重独立; face features 暂不 re-encode(轻量档 A/B)。
   use_base_displacement: true
+  base_disp_reencode: true       # 完整版: base 位移后用 corrected base 重新编码 scan(坐标系一致)
   base_disp_hidden_dim: [128, 64]
   base_disp_init_scale: 1.0e-4   # 末层 near-zero, step 0 时 corrected_base≈base
   base_disp_use_normal: true

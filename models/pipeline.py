@@ -179,6 +179,10 @@ class Stage2Pipeline(nn.Module):
         # 先把 base 顶点"掰正"到更贴合 scan 的位置, fine decoder 再在 corrected
         # base 上细分位移。与 fine decoder 权重独立。详见 plan 文档 Part 2。
         self.use_base_displacement = config.get('use_base_displacement', False)
+        # re-encode(完整版): base 位移后, 用 corrected base 的面局部系重新分组+编码 scan,
+        # 让 encoder 看到的局部坐标与 decoder 位移所在的局部坐标完全一致。
+        # False 即 2.6 轻量档(沿用旧 frame 的特征, 仅 lp/basis 用 corrected base)。
+        self.base_disp_reencode = config.get('base_disp_reencode', False)
         if self.use_base_displacement:
             self.base_disp_head = BaseVertexDisplacementHead(
                 feature_dim=decoder_feature_dim,
@@ -186,9 +190,10 @@ class Stage2Pipeline(nn.Module):
                 init_scale=config.get('base_disp_init_scale', 1e-4),
                 use_normal=config.get('base_disp_use_normal', True),
             )
+            _tier = "full (re-encode)" if self.base_disp_reencode else "2.6 lightweight (no re-encode)"
             print(
                 f"BaseVertexDisplacementHead enabled (feature_dim={decoder_feature_dim}, "
-                f"reencode=False [2.6 lightweight tier])"
+                f"tier={_tier})"
             )
         else:
             self.base_disp_head = None
@@ -241,47 +246,32 @@ class Stage2Pipeline(nn.Module):
                         **common_kwargs
                 )
 
-    def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None, 
-                return_attention=False, return_diagnostics=False):
-        """
-        Args:
-            base_verts: (B, V, 3)
-            base_faces: (B, F, 3)
-            base_normals: (B, V, 3)
-            scan_points: (B, P, 3)
-            scan_normals: (B, P, 3) or None
-            return_attention: bool, 是否返回注意力分数（仅当 encoder_type='attentive' 时有效）
-            return_diagnostics: bool, 是否返回诊断信息（attentive / cross_attention 时有效）
+    def _group_and_encode(self, base_verts, base_faces, base_normals, scan_points,
+                          scan_normals, do_log, return_attention=False,
+                          return_diagnostics=False):
+        """Group scan points around (base_verts, base_faces) 并编码成 per-anchor 特征。
+
+        关键(坐标系一致性): 所有局部坐标 (u, v, d) 与法线差都由传入的
+        base_verts/base_faces 经 _compute_face_basis 现场计算。因此把 corrected
+        base 传进来, 即可让 re-encode 的 encoder 局部坐标系与 decoder 位移所在的
+        局部坐标系完全一致 —— 这是完整版能学到东西的前提。
 
         Returns:
-            fine_verts: (B, V_fine, 3)
-            fine_faces: (F_fine, 3)
-            displacements: (B, V_fine, 1)
-            trans_feat: (B*V, K, K) or None (for regularization loss)
-            vertex_features: (B, V, D) (Debug: check variance)
-            kl_loss: scalar or None (VAE KL divergence loss)
-            attention_scores: (B*P, H) or None, 注意力分数（仅当 return_attention=True 且 encoder_type='attentive'）
-            global_cluster_idx: (B*P,) or None, 全局 cluster 索引（仅当 return_attention=True 且 encoder_type='attentive'）
-            diagnostics: dict or None, 诊断信息（仅当 return_diagnostics=True 且 encoder 为 attentive/cross_attention）
+            (vertex_features, trans_feat, diagnostics, attention_scores, global_cluster_idx)
         """
-        do_log = bool(getattr(self, "_profile_timing", False))
-        if do_log:
-            self._profile_counter = getattr(self, "_profile_counter", 0) + 1
-            iv = int(getattr(self, "_profile_interval", 50))
-            do_log = (self._profile_counter % max(iv, 1)) == 0 and profile_is_rank0()
-        for _sub in (self.grouper, self.encoder, self.decoder):
-            setattr(_sub, "_profile_do_log", do_log)
-
-        # 1. Grouping
         B, V, _ = base_verts.shape
         _, num_faces_dim, _ = base_faces.shape
-        t0 = prof_start() if do_log else None
 
         is_face = self.encoding_mode == 'face'
         is_vertex_knn = self.grouper_type == 'vertex_knn'
         is_auto_knn = self.grouper_type == 'auto_knn'
         is_pt_sa = isinstance(self.encoder, (PTSAEncoder, PTFlashHierarchicalEncoder))
 
+        # 1. Grouping
+        t0 = prof_start() if do_log else None
+        auto_buckets = None
+        grouped_features = local_coords = None
+        local_points = cluster_idx = None
         if is_face:
             if is_auto_knn:
                 auto_buckets = self.grouper(
@@ -311,10 +301,8 @@ class Stage2Pipeline(nn.Module):
         # 2. Encoding
         diagnostics = None
         attention_scores, global_cluster_idx = None, None
-
         is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
         is_cross_attn = isinstance(self.encoder, CrossAttentionFeatureEncoder)
-
         num_anchors = num_faces_dim if is_face else V
 
         if is_auto_knn and is_pt_sa:
@@ -326,7 +314,7 @@ class Stage2Pipeline(nn.Module):
                 bk_feat, _ = self.encoder(gf_bk, lc_bk)
                 vertex_features[0, fidx_bk[0]] = bk_feat[0].to(
                     dtype=vertex_features.dtype
-                )            
+                )
             trans_feat = None
             if do_log:
                 prof_split(True, t0, "encoder(total)", "pipe")
@@ -378,56 +366,129 @@ class Stage2Pipeline(nn.Module):
                 if do_log:
                     prof_split(True, t0, "encoder(total)", "pipe")
 
-        # 2.5 VAE Bottleneck (optional)
+        return vertex_features, trans_feat, diagnostics, attention_scores, global_cluster_idx
+
+    def forward(self, base_verts, base_faces, base_normals, scan_points, scan_normals=None, 
+                return_attention=False, return_diagnostics=False):
+        """
+        Args:
+            base_verts: (B, V, 3)
+            base_faces: (B, F, 3)
+            base_normals: (B, V, 3)
+            scan_points: (B, P, 3)
+            scan_normals: (B, P, 3) or None
+            return_attention: bool, 是否返回注意力分数（仅当 encoder_type='attentive' 时有效）
+            return_diagnostics: bool, 是否返回诊断信息（attentive / cross_attention 时有效）
+
+        Returns:
+            fine_verts: (B, V_fine, 3)
+            fine_faces: (F_fine, 3)
+            displacements: (B, V_fine, 1)
+            trans_feat: (B*V, K, K) or None (for regularization loss)
+            vertex_features: (B, V, D) (Debug: check variance)
+            kl_loss: scalar or None (VAE KL divergence loss)
+            attention_scores: (B*P, H) or None, 注意力分数（仅当 return_attention=True 且 encoder_type='attentive'）
+            global_cluster_idx: (B*P,) or None, 全局 cluster 索引（仅当 return_attention=True 且 encoder_type='attentive'）
+            diagnostics: dict or None, 诊断信息（仅当 return_diagnostics=True 且 encoder 为 attentive/cross_attention）
+        """
+        do_log = bool(getattr(self, "_profile_timing", False))
+        if do_log:
+            self._profile_counter = getattr(self, "_profile_counter", 0) + 1
+            iv = int(getattr(self, "_profile_interval", 50))
+            do_log = (self._profile_counter % max(iv, 1)) == 0 and profile_is_rank0()
+        for _sub in (self.grouper, self.encoder, self.decoder):
+            setattr(_sub, "_profile_do_log", do_log)
+
+        B, V, _ = base_verts.shape
+        _, num_faces_dim, _ = base_faces.shape
+        is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
+        is_cross_attn = isinstance(self.encoder, CrossAttentionFeatureEncoder)
+
+        # === Pass 1: 针对 *原始* base 分组+编码 (用于 base 位移头) ===
+        feat1, trans_feat, diagnostics, attention_scores, global_cluster_idx = \
+            self._group_and_encode(
+                base_verts, base_faces, base_normals, scan_points, scan_normals,
+                do_log, return_attention=return_attention,
+                return_diagnostics=return_diagnostics,
+            )
+
+        reencode = (self.base_disp_head is not None) and self.base_disp_reencode
+
+        self._last_base_disp = None
+        self._last_base_disp_reg = None
+        decode_base_verts = base_verts
+
+        if reencode:
+            # === 完整版 ===
+            # (a) base 位移头吃 *pass-1* 特征(编码端运算, corrected base 直接作为
+            #     传输的 base mesh, 无需量化), 得到 corrected base。
+            t0 = prof_start() if do_log else None
+            base_disp = self.base_disp_head(base_verts, base_faces, feat1, base_normals)
+            decode_base_verts = base_verts + base_disp
+            self._last_base_disp = base_disp
+            self._last_base_disp_reg = (base_disp ** 2).sum(dim=-1).mean()
+            if do_log:
+                prof_split(True, t0, "base_disp_head", "pipe")
+            # (b) 针对 corrected base 重新分组+编码: 局部坐标系与 decoder 位移坐标系一致。
+            t0 = prof_start() if do_log else None
+            feats_main, trans_feat2, _, _, _ = self._group_and_encode(
+                decode_base_verts, base_faces, base_normals, scan_points, scan_normals,
+                do_log,
+            )
+            if trans_feat2 is not None:
+                trans_feat = trans_feat2
+            if do_log:
+                prof_split(True, t0, "reencode(total)", "pipe")
+        else:
+            feats_main = feat1
+
+        # 2.5 VAE Bottleneck (optional): 作用在喂 decoder 的主特征上。
         kl_loss = None
         if self.vae_head is not None:
             t0 = prof_start() if do_log else None
-            vertex_features, kl_loss = self.vae_head(vertex_features)
+            feats_main, kl_loss = self.vae_head(feats_main)
             if do_log:
                 prof_split(True, t0, "vae_head", "pipe")
 
-        # 2.6 Residual VQ (optional): 分层量化, 损失走属性通道(_last_vq_loss),
-        # 不改变本 forward 的返回签名(保持与 infer/overfit 的 6 元组解包兼容)。
+        # 2.6 Residual VQ (optional): 量化 *fine* 主特征。
         self._last_vq_loss = None
         self._last_rvq_indices = None
         self._last_rvq_recon_err = None
         self._last_feat_norm = None
         if self.rvq is not None:
             t0 = prof_start() if do_log else None
-            # 崩塌监控: 量化前特征范数 + 量化重建误差(详见 plan Part 1.3)
             with torch.no_grad():
-                feat_pre = vertex_features
+                feat_pre = feats_main
                 self._last_feat_norm = feat_pre.detach().norm(dim=-1).mean()
-            vertex_features, rvq_indices, vq_loss = self.rvq(
-                vertex_features, num_active=self._rvq_num_active
+            feats_main, rvq_indices, vq_loss = self.rvq(
+                feats_main, num_active=self._rvq_num_active
             )
             self._last_vq_loss = vq_loss
             self._last_rvq_indices = rvq_indices
             with torch.no_grad():
                 self._last_rvq_recon_err = (
-                    (vertex_features.detach() - feat_pre.detach()).norm(dim=-1).mean()
+                    (feats_main.detach() - feat_pre.detach()).norm(dim=-1).mean()
                 )
             if do_log:
                 prof_split(True, t0, "rvq", "pipe")
         else:
             with torch.no_grad():
-                self._last_feat_norm = vertex_features.detach().norm(dim=-1).mean()
+                self._last_feat_norm = feats_main.detach().norm(dim=-1).mean()
 
-        # 2.7 Base Vertex Displacement (optional, 2.6 轻量档): 先移 base 顶点,
-        # fine decoder 在 corrected base 上细分。face features **不** re-encode。
-        self._last_base_disp = None
-        self._last_base_disp_reg = None
-        decode_base_verts = base_verts
-        if self.base_disp_head is not None:
+        # 2.7 Base Vertex Displacement —— 2.6 轻量档(non-reencode): base 位移头吃
+        # *量化后* 主特征(沿用已验证的行为), 仅 lp/face basis 用 corrected base。
+        if (self.base_disp_head is not None) and (not reencode):
             t0 = prof_start() if do_log else None
             base_disp = self.base_disp_head(
-                base_verts, base_faces, vertex_features, base_normals
+                base_verts, base_faces, feats_main, base_normals
             )
             decode_base_verts = base_verts + base_disp
             self._last_base_disp = base_disp
             self._last_base_disp_reg = (base_disp ** 2).sum(dim=-1).mean()
             if do_log:
                 prof_split(True, t0, "base_disp_head", "pipe")
+
+        vertex_features = feats_main  # 供返回(debug / 解包兼容)
 
         # 3. Decoding (在 corrected base 上细分; lp / face basis 随 base 位移更新)
         t0 = prof_start() if do_log else None
