@@ -404,24 +404,27 @@ class Stage2Pipeline(nn.Module):
         is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
         is_cross_attn = isinstance(self.encoder, CrossAttentionFeatureEncoder)
 
-        # === Pass 1: 针对 *原始* base 分组+编码 (用于 base 位移头) ===
-        feat1, trans_feat, diagnostics, attention_scores, global_cluster_idx = \
-            self._group_and_encode(
-                base_verts, base_faces, base_normals, scan_points, scan_normals,
-                do_log, return_attention=return_attention,
-                return_diagnostics=return_diagnostics,
-            )
-
         reencode = (self.base_disp_head is not None) and self.base_disp_reencode
 
         self._last_base_disp = None
         self._last_base_disp_reg = None
         decode_base_verts = base_verts
+        trans_feat = None
+        diagnostics = None
+        attention_scores = None
+        global_cluster_idx = None
 
         if reencode:
-            # === 完整版 ===
-            # (a) base 位移头吃 *pass-1* 特征(编码端运算, corrected base 直接作为
-            #     传输的 base mesh, 无需量化), 得到 corrected base。
+            # === 完整版(re-encode), 显存优化: pass-1 放 no_grad ===
+            # pass-1 仅用来给 base 位移头提供特征; corrected base 本就作为传输的
+            # base mesh(做法 A, 无需量化), 不需要对 pass-1 反传。因此 pass-1 在
+            # no_grad 下前向 —— **不保留计算图**, 消除"双编码图"的显存峰值(OOM 根因)。
+            # base_disp_head 仍可训练: 梯度经 pass-2(re-encode 特征对 corrected base
+            # 可微) 与 decoder(lp/basis) 两路回传。
+            with torch.no_grad():
+                feat1, *_ = self._group_and_encode(
+                    base_verts, base_faces, base_normals, scan_points, scan_normals, do_log
+                )
             t0 = prof_start() if do_log else None
             base_disp = self.base_disp_head(base_verts, base_faces, feat1, base_normals)
             decode_base_verts = base_verts + base_disp
@@ -429,18 +432,23 @@ class Stage2Pipeline(nn.Module):
             self._last_base_disp_reg = (base_disp ** 2).sum(dim=-1).mean()
             if do_log:
                 prof_split(True, t0, "base_disp_head", "pipe")
-            # (b) 针对 corrected base 重新分组+编码: 局部坐标系与 decoder 位移坐标系一致。
+            del feat1
+            # pass-2(带梯度): 在 corrected base 上分组+编码, 局部坐标系与 decoder 一致。
             t0 = prof_start() if do_log else None
-            feats_main, trans_feat2, _, _, _ = self._group_and_encode(
+            feats_main, trans_feat, _, _, _ = self._group_and_encode(
                 decode_base_verts, base_faces, base_normals, scan_points, scan_normals,
                 do_log,
             )
-            if trans_feat2 is not None:
-                trans_feat = trans_feat2
             if do_log:
                 prof_split(True, t0, "reencode(total)", "pipe")
         else:
-            feats_main = feat1
+            # 2.6 轻量档 / 无 base 位移: 单次编码(带梯度)。
+            feats_main, trans_feat, diagnostics, attention_scores, global_cluster_idx = \
+                self._group_and_encode(
+                    base_verts, base_faces, base_normals, scan_points, scan_normals,
+                    do_log, return_attention=return_attention,
+                    return_diagnostics=return_diagnostics,
+                )
 
         # 2.5 VAE Bottleneck (optional): 作用在喂 decoder 的主特征上。
         kl_loss = None

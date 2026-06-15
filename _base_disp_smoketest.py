@@ -137,7 +137,8 @@ def _run_pipeline_case(reencode: bool):
     assert seen, "base_disp_head got no gradient"
     assert math.isfinite(head_grad), "base_disp_head grad not finite"
     assert head_grad > 0, "base_disp_head grad is exactly 0 (not wired e2e)"
-    src = "pass-1 feats + re-encoded fine feats" if reencode else "post-RVQ feats + decoder lp/basis"
+    src = ("re-encoded fine feats + decoder lp/basis (pass-1 no_grad)" if reencode
+           else "post-RVQ feats + decoder lp/basis")
     print(f"  [OK] base_disp_head total grad norm = {head_grad:.4e} (grad src: {src})")
 
 
