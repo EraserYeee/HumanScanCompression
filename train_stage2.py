@@ -392,7 +392,12 @@ def train(config, args):
                     w_lap = config['loss'].get('w_laplacian', 0.0)
                     if w_lap > 0:
                         loss_lap = compute_uniform_laplacian_l1(f_verts[0], f_faces)
+                    # Fine displacement magnitude penalty: 惩罚细分点相对 corrected base
+                    # 的位移幅度, 逼 base 承担粗对齐(避免 fine 残差吸收一切 -> base 欠位移)。
                     loss_disp = torch.tensor(0.0, device=accelerator.device)
+                    w_disp_cfg_now = config['loss'].get('w_disp', 0.0)
+                    if w_disp_cfg_now > 0 and disp is not None:
+                        loss_disp = (disp ** 2).sum(dim=-1).mean()
                     loss_mat = torch.tensor(0.0, device=accelerator.device)
                     loss_kl = torch.tensor(0.0, device=accelerator.device)
                     if model_kl_loss is not None:

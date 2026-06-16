@@ -83,16 +83,16 @@ def test_head_isolated():
     print("  [OK] gradients flow to head + face features")
 
 
-def _run_pipeline_case(reencode: bool):
-    tier = "full (re-encode)" if reencode else "2.6 lightweight"
-    print(f"[test] Stage2Pipeline forward/backward (use_base_displacement, {tier}) ...")
+def _run_pipeline_case(mode: str):
+    print(f"[test] Stage2Pipeline forward/backward (use_base_displacement, mode={mode}) ...")
     cfg_path = os.path.join(os.path.dirname(__file__), "configs", "config_ptsa.yaml")
     config = load_config(cfg_path)
     mcfg = config["model"]
     # 缩小以加速冒烟
     mcfg["subdivision_rate"] = 4
     mcfg["use_base_displacement"] = True
-    mcfg["base_disp_reencode"] = reencode
+    mcfg["base_disp_mode"] = mode
+    mcfg["base_disp_knn_k"] = 16
     assert mcfg.get("encoding_mode") == "face", "smoke test 假设 encoding_mode=face"
 
     torch.manual_seed(0)
@@ -122,30 +122,30 @@ def _run_pipeline_case(reencode: bool):
         print(f"  [OK] rvq recon_err={float(model._last_rvq_recon_err):.4f}, "
               f"feat_norm={float(model._last_feat_norm):.4f}")
 
-    # dummy 渲染状损失 -> backward -> 确认 base 位移头收到梯度
-    loss = f_verts.pow(2).mean()
+    # dummy 渲染状损失 + fine 位移惩罚 -> backward -> 确认 base 模块收到梯度
+    loss = f_verts.pow(2).mean() + (disp ** 2).sum(dim=-1).mean()
     if model._last_vq_loss is not None:
         loss = loss + model._last_vq_loss
     loss.backward()
 
+    base_mod = model.base_predictor if mode == "predict" else model.base_disp_head
+    assert base_mod is not None, f"no base module for mode={mode}"
     head_grad = 0.0
     seen = False
-    for p in model.base_disp_head.parameters():
+    for p in base_mod.parameters():
         if p.grad is not None:
             head_grad += p.grad.norm().item()
             seen = True
-    assert seen, "base_disp_head got no gradient"
-    assert math.isfinite(head_grad), "base_disp_head grad not finite"
-    assert head_grad > 0, "base_disp_head grad is exactly 0 (not wired e2e)"
-    src = ("re-encoded fine feats + decoder lp/basis (pass-1 no_grad)" if reencode
-           else "post-RVQ feats + decoder lp/basis")
-    print(f"  [OK] base_disp_head total grad norm = {head_grad:.4e} (grad src: {src})")
+    assert seen, "base module got no gradient"
+    assert math.isfinite(head_grad), "base module grad not finite"
+    assert head_grad > 0, "base module grad is exactly 0 (not wired e2e)"
+    print(f"  [OK] base module total grad norm = {head_grad:.4e} (wired e2e)")
 
 
 def test_pipeline_forward_backward():
-    _run_pipeline_case(reencode=False)
-    print()
-    _run_pipeline_case(reencode=True)
+    for m in ("predict", "reencode", "lightweight"):
+        _run_pipeline_case(m)
+        print()
 
 
 def test_pipeline_disabled():

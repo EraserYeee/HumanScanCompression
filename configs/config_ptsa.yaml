@@ -23,7 +23,7 @@ experiment_name: stage2_ptsa_attentive_facecoding_autoknn
 loss:
   use_chamfer: false
   w_chamfer: 100.0
-  w_disp: 0.0
+  w_disp: 1.0                # fine 位移幅度惩罚: >0 逼 base 承担粗对齐(治 base 欠位移; 建议配合 predict 模式设 1~10 试)
   w_laplacian: 0.0
   w_mat: 0.001
   w_seam: 10.0                # seam consistency: 相邻面共享边位移主动一致, 治 sliver
@@ -79,10 +79,16 @@ model:
   # 先把 base 顶点掰正再细分, fine decoder 在 corrected base 上做小残差位移。
   # 与 fine decoder 权重独立; face features 暂不 re-encode(轻量档 A/B)。
   use_base_displacement: true
-  base_disp_reencode: true       # 完整版: base 位移后用 corrected base 重新编码 scan(坐标系一致)
-  base_disp_hidden_dim: [128, 64]
+  # 模式: predict(#1, 廉价预测头+重型编码只跑一次, 推荐) | reencode(#2) | lightweight(2.6)
+  base_disp_mode: predict
   base_disp_init_scale: 1.0e-4   # 末层 near-zero, step 0 时 corrected_base≈base
   base_disp_use_normal: true
+  # --- #1 predict 模式: 廉价几何预测头(vertex-KNN + PointNet, 无 self-attention) ---
+  base_disp_knn_k: 32            # 每个 base 顶点取的 scan 邻居数(小)
+  base_disp_pointnet_hidden: [64, 128]
+  base_disp_head_hidden: [64]
+  # --- reencode/lightweight 模式专用 ---
+  base_disp_hidden_dim: [128, 64]
 
   # --- VAE (disabled) ---
   use_vae: false

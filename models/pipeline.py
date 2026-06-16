@@ -14,7 +14,7 @@ from .decoder import NeuralSubdivisionDecoder
 from .decoder_sumof_feature import SumOfFeatureDecoder
 from .decoder_face_triangle import FaceTriangleDecoder
 from .rvq import ResidualVQ
-from .base_displacement import BaseVertexDisplacementHead
+from .base_displacement import BaseVertexDisplacementHead, BaseDisplacePredictor
 
 class Stage2Pipeline(nn.Module):
     """
@@ -179,24 +179,43 @@ class Stage2Pipeline(nn.Module):
         # 先把 base 顶点"掰正"到更贴合 scan 的位置, fine decoder 再在 corrected
         # base 上细分位移。与 fine decoder 权重独立。详见 plan 文档 Part 2。
         self.use_base_displacement = config.get('use_base_displacement', False)
-        # re-encode(完整版): base 位移后, 用 corrected base 的面局部系重新分组+编码 scan,
-        # 让 encoder 看到的局部坐标与 decoder 位移所在的局部坐标完全一致。
-        # False 即 2.6 轻量档(沿用旧 frame 的特征, 仅 lp/basis 用 corrected base)。
-        self.base_disp_reencode = config.get('base_disp_reencode', False)
+        # 模式:
+        #   'predict'    : #1 廉价几何预测头(vertex-KNN+PointNet)先移 base, 重型
+        #                  encoder 只在 corrected base 上跑一次(推荐, 计算/显存最优)。
+        #   'reencode'   : #2 face encode(pass-1 no_grad)->base 头->corrected->重型再编一次。
+        #   'lightweight': 2.6 单次编码(原 base), base 头吃 post-RVQ 特征, 仅 lp/basis 用 corrected base。
+        _mode = config.get('base_disp_mode', None)
+        if _mode is None:  # 向后兼容旧 config
+            _mode = 'reencode' if config.get('base_disp_reencode', False) else 'lightweight'
+        self.base_disp_mode = _mode if self.use_base_displacement else 'none'
+
+        self.base_disp_head = None      # 'reencode' / 'lightweight' 用
+        self.base_predictor = None      # 'predict' 用
         if self.use_base_displacement:
-            self.base_disp_head = BaseVertexDisplacementHead(
-                feature_dim=decoder_feature_dim,
-                hidden_dim=config.get('base_disp_hidden_dim', [128, 64]),
-                init_scale=config.get('base_disp_init_scale', 1e-4),
-                use_normal=config.get('base_disp_use_normal', True),
-            )
-            _tier = "full (re-encode)" if self.base_disp_reencode else "2.6 lightweight (no re-encode)"
-            print(
-                f"BaseVertexDisplacementHead enabled (feature_dim={decoder_feature_dim}, "
-                f"tier={_tier})"
-            )
-        else:
-            self.base_disp_head = None
+            if self.base_disp_mode == 'predict':
+                self.base_predictor = BaseDisplacePredictor(
+                    knn_k=config.get('base_disp_knn_k', 32),
+                    pointnet_hidden=config.get('base_disp_pointnet_hidden', [64, 128]),
+                    head_hidden=config.get('base_disp_head_hidden', [64]),
+                    use_normal=config.get('base_disp_use_normal', True),
+                    init_scale=config.get('base_disp_init_scale', 1e-4),
+                    knn_chunk_size=config.get('vertex_knn_chunk_size', 512),
+                )
+                print(
+                    f"BaseDisplacePredictor enabled (#1 'predict' mode, "
+                    f"knn_k={config.get('base_disp_knn_k', 32)}; heavy encoder runs ONCE)"
+                )
+            else:
+                self.base_disp_head = BaseVertexDisplacementHead(
+                    feature_dim=decoder_feature_dim,
+                    hidden_dim=config.get('base_disp_hidden_dim', [128, 64]),
+                    init_scale=config.get('base_disp_init_scale', 1e-4),
+                    use_normal=config.get('base_disp_use_normal', True),
+                )
+                print(
+                    f"BaseVertexDisplacementHead enabled (feature_dim={decoder_feature_dim}, "
+                    f"mode={self.base_disp_mode})"
+                )
         self._last_base_disp = None
         self._last_base_disp_reg = None
         
@@ -404,7 +423,7 @@ class Stage2Pipeline(nn.Module):
         is_attentive = isinstance(self.encoder, AttentiveLocalFeatureEncoder)
         is_cross_attn = isinstance(self.encoder, CrossAttentionFeatureEncoder)
 
-        reencode = (self.base_disp_head is not None) and self.base_disp_reencode
+        mode = self.base_disp_mode
 
         self._last_base_disp = None
         self._last_base_disp_reg = None
@@ -414,13 +433,23 @@ class Stage2Pipeline(nn.Module):
         attention_scores = None
         global_cluster_idx = None
 
-        if reencode:
-            # === 完整版(re-encode), 显存优化: pass-1 放 no_grad ===
-            # pass-1 仅用来给 base 位移头提供特征; corrected base 本就作为传输的
-            # base mesh(做法 A, 无需量化), 不需要对 pass-1 反传。因此 pass-1 在
-            # no_grad 下前向 —— **不保留计算图**, 消除"双编码图"的显存峰值(OOM 根因)。
-            # base_disp_head 仍可训练: 梯度经 pass-2(re-encode 特征对 corrected base
-            # 可微) 与 decoder(lp/basis) 两路回传。
+        if mode == 'predict':
+            # === #1: 廉价几何预测头先移 base, 重型 encoder 只在 corrected base 上跑一次 ===
+            t0 = prof_start() if do_log else None
+            base_disp = self.base_predictor(base_verts, base_normals, scan_points, scan_normals)
+            decode_base_verts = base_verts + base_disp
+            self._last_base_disp = base_disp
+            self._last_base_disp_reg = (base_disp ** 2).sum(dim=-1).mean()
+            if do_log:
+                prof_split(True, t0, "base_predictor", "pipe")
+            # 唯一一次重型编码: 在 corrected base 上, 局部坐标系与 decoder 位移系一致。
+            feats_main, trans_feat, _, _, _ = self._group_and_encode(
+                decode_base_verts, base_faces, base_normals, scan_points, scan_normals, do_log
+            )
+        elif mode == 'reencode':
+            # === #2: face encode(pass-1 no_grad) -> base 头 -> corrected -> 重型再编一次 ===
+            # pass-1 仅给 base 头提供特征; corrected base 作为传输 base mesh, 无需对
+            # pass-1 反传 -> no_grad 不保留计算图, 消除"双编码图"显存峰值。
             with torch.no_grad():
                 feat1, *_ = self._group_and_encode(
                     base_verts, base_faces, base_normals, scan_points, scan_normals, do_log
@@ -433,16 +462,11 @@ class Stage2Pipeline(nn.Module):
             if do_log:
                 prof_split(True, t0, "base_disp_head", "pipe")
             del feat1
-            # pass-2(带梯度): 在 corrected base 上分组+编码, 局部坐标系与 decoder 一致。
-            t0 = prof_start() if do_log else None
             feats_main, trans_feat, _, _, _ = self._group_and_encode(
-                decode_base_verts, base_faces, base_normals, scan_points, scan_normals,
-                do_log,
+                decode_base_verts, base_faces, base_normals, scan_points, scan_normals, do_log
             )
-            if do_log:
-                prof_split(True, t0, "reencode(total)", "pipe")
         else:
-            # 2.6 轻量档 / 无 base 位移: 单次编码(带梯度)。
+            # 'lightweight' (2.6) 或 'none': 单次编码(带梯度, 原始 base)。
             feats_main, trans_feat, diagnostics, attention_scores, global_cluster_idx = \
                 self._group_and_encode(
                     base_verts, base_faces, base_normals, scan_points, scan_normals,
@@ -483,9 +507,9 @@ class Stage2Pipeline(nn.Module):
             with torch.no_grad():
                 self._last_feat_norm = feats_main.detach().norm(dim=-1).mean()
 
-        # 2.7 Base Vertex Displacement —— 2.6 轻量档(non-reencode): base 位移头吃
-        # *量化后* 主特征(沿用已验证的行为), 仅 lp/face basis 用 corrected base。
-        if (self.base_disp_head is not None) and (not reencode):
+        # 2.7 Base Vertex Displacement —— 'lightweight'(2.6): base 位移头吃 *量化后*
+        # 主特征(沿用已验证的行为), 仅 lp/face basis 用 corrected base。
+        if mode == 'lightweight' and self.base_disp_head is not None:
             t0 = prof_start() if do_log else None
             base_disp = self.base_disp_head(
                 base_verts, base_faces, feats_main, base_normals
